@@ -136,71 +136,81 @@ export const defaultAssistantsVersion = {
   [EModelEndpoint.azureAssistants]: 1,
 };
 
-export const assistantEndpointSchema = z.object({
-  /* assistants specific */
-  disableBuilder: z.boolean().optional(),
-  pollIntervalMs: z.number().optional(),
-  timeoutMs: z.number().optional(),
-  version: z.union([z.string(), z.number()]).default(2),
-  supportedIds: z.array(z.string()).min(1).optional(),
-  excludedIds: z.array(z.string()).min(1).optional(),
-  privateAssistants: z.boolean().optional(),
-  retrievalModels: z.array(z.string()).min(1).optional().default(defaultRetrievalModels),
-  capabilities: z
-    .array(z.nativeEnum(Capabilities))
-    .optional()
-    .default([
-      Capabilities.code_interpreter,
-      Capabilities.image_vision,
-      Capabilities.retrieval,
-      Capabilities.actions,
-      Capabilities.tools,
-    ]),
-  /* general */
-  apiKey: z.string().optional(),
-  baseURL: z.string().optional(),
-  models: z
-    .object({
-      default: z.array(z.string()).min(1),
-      fetch: z.boolean().optional(),
-      userIdQuery: z.boolean().optional(),
-    })
-    .optional(),
-  titleConvo: z.boolean().optional(),
-  titleMethod: z.union([z.literal('completion'), z.literal('functions')]).optional(),
-  titleModel: z.string().optional(),
-  headers: z.record(z.any()).optional(),
+export const baseEndpointSchema = z.object({
+  streamRate: z.number().optional(),
 });
+
+export type TBaseEndpoint = z.infer<typeof baseEndpointSchema>;
+
+export const assistantEndpointSchema = baseEndpointSchema.merge(
+  z.object({
+    /* assistants specific */
+    disableBuilder: z.boolean().optional(),
+    pollIntervalMs: z.number().optional(),
+    timeoutMs: z.number().optional(),
+    version: z.union([z.string(), z.number()]).default(2),
+    supportedIds: z.array(z.string()).min(1).optional(),
+    excludedIds: z.array(z.string()).min(1).optional(),
+    privateAssistants: z.boolean().optional(),
+    retrievalModels: z.array(z.string()).min(1).optional().default(defaultRetrievalModels),
+    capabilities: z
+      .array(z.nativeEnum(Capabilities))
+      .optional()
+      .default([
+        Capabilities.code_interpreter,
+        Capabilities.image_vision,
+        Capabilities.retrieval,
+        Capabilities.actions,
+        Capabilities.tools,
+      ]),
+    /* general */
+    apiKey: z.string().optional(),
+    baseURL: z.string().optional(),
+    models: z
+      .object({
+        default: z.array(z.string()).min(1),
+        fetch: z.boolean().optional(),
+        userIdQuery: z.boolean().optional(),
+      })
+      .optional(),
+    titleConvo: z.boolean().optional(),
+    titleMethod: z.union([z.literal('completion'), z.literal('functions')]).optional(),
+    titleModel: z.string().optional(),
+    headers: z.record(z.any()).optional(),
+  }),
+);
 
 export type TAssistantEndpoint = z.infer<typeof assistantEndpointSchema>;
 
-export const endpointSchema = z.object({
-  name: z.string().refine((value) => !eModelEndpointSchema.safeParse(value).success, {
-    message: `Value cannot be one of the default endpoint (EModelEndpoint) values: ${Object.values(
-      EModelEndpoint,
-    ).join(', ')}`,
+export const endpointSchema = baseEndpointSchema.merge(
+  z.object({
+    name: z.string().refine((value) => !eModelEndpointSchema.safeParse(value).success, {
+      message: `Value cannot be one of the default endpoint (EModelEndpoint) values: ${Object.values(
+        EModelEndpoint,
+      ).join(', ')}`,
+    }),
+    apiKey: z.string(),
+    baseURL: z.string(),
+    models: z.object({
+      default: z.array(z.string()).min(1),
+      fetch: z.boolean().optional(),
+      userIdQuery: z.boolean().optional(),
+    }),
+    titleConvo: z.boolean().optional(),
+    titleMethod: z.union([z.literal('completion'), z.literal('functions')]).optional(),
+    titleModel: z.string().optional(),
+    summarize: z.boolean().optional(),
+    summaryModel: z.string().optional(),
+    forcePrompt: z.boolean().optional(),
+    modelDisplayLabel: z.string().optional(),
+    headers: z.record(z.any()).optional(),
+    addParams: z.record(z.any()).optional(),
+    dropParams: z.array(z.string()).optional(),
+    customOrder: z.number().optional(),
+    directEndpoint: z.boolean().optional(),
+    titleMessageRole: z.string().optional(),
   }),
-  apiKey: z.string(),
-  baseURL: z.string(),
-  models: z.object({
-    default: z.array(z.string()).min(1),
-    fetch: z.boolean().optional(),
-    userIdQuery: z.boolean().optional(),
-  }),
-  titleConvo: z.boolean().optional(),
-  titleMethod: z.union([z.literal('completion'), z.literal('functions')]).optional(),
-  titleModel: z.string().optional(),
-  summarize: z.boolean().optional(),
-  summaryModel: z.string().optional(),
-  forcePrompt: z.boolean().optional(),
-  modelDisplayLabel: z.string().optional(),
-  headers: z.record(z.any()).optional(),
-  addParams: z.record(z.any()).optional(),
-  dropParams: z.array(z.string()).optional(),
-  customOrder: z.number().optional(),
-  directEndpoint: z.boolean().optional(),
-  titleMessageRole: z.string().optional(),
-});
+);
 
 export type TEndpoint = z.infer<typeof endpointSchema>;
 
@@ -213,6 +223,7 @@ export const azureEndpointSchema = z
   .and(
     endpointSchema
       .pick({
+        streamRate: true,
         titleConvo: true,
         titleMethod: true,
         titleModel: true,
@@ -369,10 +380,15 @@ export const configSchema = z.object({
   modelSpecs: specsConfigSchema.optional(),
   endpoints: z
     .object({
+      all: baseEndpointSchema.optional(),
+      [EModelEndpoint.openAI]: baseEndpointSchema.optional(),
+      [EModelEndpoint.google]: baseEndpointSchema.optional(),
+      [EModelEndpoint.anthropic]: baseEndpointSchema.optional(),
+      [EModelEndpoint.gptPlugins]: baseEndpointSchema.optional(),
       [EModelEndpoint.azureOpenAI]: azureEndpointSchema.optional(),
       [EModelEndpoint.azureAssistants]: assistantEndpointSchema.optional(),
       [EModelEndpoint.assistants]: assistantEndpointSchema.optional(),
-      custom: z.array(endpointSchema.partial()).optional(),
+      [EModelEndpoint.custom]: z.array(endpointSchema.partial()).optional(),
     })
     .strict()
     .refine((data) => Object.keys(data).length > 0, {
@@ -825,7 +841,7 @@ export enum Constants {
   /** Key for the app's version. */
   VERSION = 'v0.7.4-rc1',
   /** Key for the Custom Config's version (librechat.yaml). */
-  CONFIG_VERSION = '1.1.4',
+  CONFIG_VERSION = '1.1.5',
   /** Standard value for the first message's `parentMessageId` value, to indicate no parent exists. */
   NO_PARENT = '00000000-0000-0000-0000-000000000000',
   /** Standard value for the initial conversationId before a request is sent */

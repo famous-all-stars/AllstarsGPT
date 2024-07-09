@@ -64,8 +64,8 @@ export default defineConfig({
         maximumFileSizeToCacheInBytes: 3 * 1024 * 1024,
       },
       manifest: {
-        name: 'FASChat',
-        short_name: 'FASChat',
+        name: 'AllstarsGPT',
+        short_name: 'AllstarsGPT',
         start_url: '/',
         display: 'standalone',
         background_color: '#000000',

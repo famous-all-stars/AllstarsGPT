@@ -9,7 +9,6 @@ import { useGetEndpointsQuery } from '~/data-provider';
 import NavToggle from '~/components/Nav/NavToggle';
 import { cn, getEndpointField } from '~/utils';
 import { useChatContext } from '~/Providers';
-
 import Nav from './Nav';
 
 const defaultMinSize = 20;
@@ -62,8 +61,6 @@ const SidePanel = ({
     () => getEndpointField(endpointsConfig, endpoint, 'type'),
     [endpoint, endpointsConfig],
   );
-  const assistants = useMemo(() => endpointsConfig?.[endpoint ?? ''], [endpoint, endpointsConfig]);
-  const agents = useMemo(() => endpointsConfig?.[endpoint ?? ''], [endpoint, endpointsConfig]);
 
   const userProvidesKey = useMemo(
     () => !!(endpointsConfig?.[endpoint ?? '']?.userProvide ?? false),
@@ -84,13 +81,12 @@ const SidePanel = ({
   }, []);
 
   const Links = useSideNavLinks({
-    agents,
     endpoint,
     hidePanel,
-    assistants,
     keyProvided,
     endpointType,
     interfaceConfig,
+    endpointsConfig,
   });
 
   const toggleNavVisible = useCallback(() => {

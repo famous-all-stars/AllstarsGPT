@@ -10,17 +10,7 @@ const getLogStores = require('~/cache/getLogStores');
  * */
 async function getCustomConfig() {
   const cache = getLogStores(CacheKeys.CONFIG_STORE);
-  let customConfig = await cache.get(CacheKeys.CUSTOM_CONFIG);
-
-  if (!customConfig) {
-    customConfig = await loadCustomConfig();
-  }
-
-  if (!customConfig) {
-    return null;
-  }
-
-  return customConfig;
+  return (await cache.get(CacheKeys.CUSTOM_CONFIG)) || (await loadCustomConfig());
 }
 
 /**
@@ -31,19 +21,16 @@ async function getCustomConfig() {
 async function getBalanceConfig() {
   const isLegacyEnabled = isEnabled(process.env.CHECK_BALANCE);
   const startBalance = process.env.START_BALANCE;
-  if (isLegacyEnabled || (startBalance != null && startBalance)) {
-    /** @type {TCustomConfig['balance']} */
-    const config = {
-      enabled: isLegacyEnabled,
-      startBalance: startBalance ? parseInt(startBalance, 10) : undefined,
-    };
-    return config;
-  }
+  /** @type {TCustomConfig['balance']} */
+  const config = {
+    enabled: isLegacyEnabled,
+    startBalance: startBalance != null && startBalance ? parseInt(startBalance, 10) : undefined,
+  };
   const customConfig = await getCustomConfig();
   if (!customConfig) {
-    return null;
+    return config;
   }
-  return customConfig?.['balance'] ?? null;
+  return { ...config, ...(customConfig?.['balance'] ?? {}) };
 }
 
 /**

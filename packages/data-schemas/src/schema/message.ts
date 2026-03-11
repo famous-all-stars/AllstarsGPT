@@ -1,6 +1,5 @@
 import mongoose, { Schema } from 'mongoose';
 import type { IMessage } from '~/types/message';
-import mongoMeili from '~/models/plugins/mongoMeili';
 
 const messageSchema: Schema<IMessage> = new Schema(
   {
@@ -22,6 +21,7 @@ const messageSchema: Schema<IMessage> = new Schema(
       index: true,
       required: true,
       default: null,
+      meiliIndex: true,
     },
     model: {
       type: String,
@@ -101,25 +101,6 @@ const messageSchema: Schema<IMessage> = new Schema(
       default: false,
     },
     files: { type: [{ type: mongoose.Schema.Types.Mixed }], default: undefined },
-    plugin: {
-      type: {
-        latest: {
-          type: String,
-          required: false,
-        },
-        inputs: {
-          type: [mongoose.Schema.Types.Mixed],
-          required: false,
-          default: undefined,
-        },
-        outputs: {
-          type: String,
-          required: false,
-        },
-      },
-      default: undefined,
-    },
-    plugins: { type: [{ type: mongoose.Schema.Types.Mixed }], default: undefined },
     content: {
       type: [{ type: mongoose.Schema.Types.Mixed }],
       default: undefined,
@@ -132,6 +113,7 @@ const messageSchema: Schema<IMessage> = new Schema(
     iconURL: {
       type: String,
     },
+    metadata: { type: mongoose.Schema.Types.Mixed },
     attachments: { type: [{ type: mongoose.Schema.Types.Mixed }], default: undefined },
     /*
     attachments: {
@@ -158,6 +140,10 @@ const messageSchema: Schema<IMessage> = new Schema(
     expiredAt: {
       type: Date,
     },
+    addedConvo: {
+      type: Boolean,
+      default: undefined,
+    },
   },
   { timestamps: true },
 );
@@ -166,13 +152,7 @@ messageSchema.index({ expiredAt: 1 }, { expireAfterSeconds: 0 });
 messageSchema.index({ createdAt: 1 });
 messageSchema.index({ messageId: 1, user: 1 }, { unique: true });
 
-if (process.env.MEILI_HOST && process.env.MEILI_MASTER_KEY) {
-  messageSchema.plugin(mongoMeili, {
-    host: process.env.MEILI_HOST,
-    apiKey: process.env.MEILI_MASTER_KEY,
-    indexName: 'messages',
-    primaryKey: 'messageId',
-  });
-}
+// index for MeiliSearch sync operations
+messageSchema.index({ _meiliIndex: 1, expiredAt: 1 });
 
 export default messageSchema;

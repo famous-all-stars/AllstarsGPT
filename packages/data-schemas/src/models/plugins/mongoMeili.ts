@@ -1,6 +1,17 @@
 import _ from 'lodash';
-import { MeiliSearch, Index } from 'meilisearch';
-import mongoose, { Schema, Document, Model, Query } from 'mongoose';
+import { MeiliSearch } from 'meilisearch';
+import { parseTextParts } from 'librechat-data-provider';
+import type { SearchResponse, SearchParams, Index } from 'meilisearch';
+import type {
+  CallbackWithoutResultAndOptionalError,
+  FilterQuery,
+  Document,
+  Schema,
+  Query,
+  Types,
+  Model,
+} from 'mongoose';
+import type { IConversation, IMessage } from '~/types';
 import logger from '~/config/meiliLogger';
 
 interface MongoMeiliOptions {
@@ -8,6 +19,9 @@ interface MongoMeiliOptions {
   apiKey: string;
   indexName: string;
   primaryKey: string;
+  mongoose: typeof import('mongoose');
+  syncBatchSize?: number;
+  syncDelayMs?: number;
 }
 
 interface MeiliIndexable {
@@ -15,33 +29,45 @@ interface MeiliIndexable {
   _meiliIndex?: boolean;
 }
 
-interface ContentItem {
-  type: string;
-  text?: string;
+interface SyncProgress {
+  lastSyncedId?: string;
+  totalProcessed: number;
+  totalDocuments: number;
+  isComplete: boolean;
 }
 
-interface DocumentWithMeiliIndex extends Document {
+interface _DocumentWithMeiliIndex extends Document {
   _meiliIndex?: boolean;
   preprocessObjectForIndex?: () => Record<string, unknown>;
-  addObjectToMeili?: () => Promise<void>;
-  updateObjectToMeili?: () => Promise<void>;
-  deleteObjectFromMeili?: () => Promise<void>;
-  postSaveHook?: () => void;
-  postUpdateHook?: () => void;
-  postRemoveHook?: () => void;
-  conversationId?: string;
-  content?: ContentItem[];
-  messageId?: string;
-  unfinished?: boolean;
-  messages?: unknown[];
-  title?: string;
-  toJSON(): Record<string, unknown>;
+  addObjectToMeili?: (next: CallbackWithoutResultAndOptionalError) => Promise<void>;
+  updateObjectToMeili?: (next: CallbackWithoutResultAndOptionalError) => Promise<void>;
+  deleteObjectFromMeili?: (next: CallbackWithoutResultAndOptionalError) => Promise<void>;
+  postSaveHook?: (next: CallbackWithoutResultAndOptionalError) => void;
+  postUpdateHook?: (next: CallbackWithoutResultAndOptionalError) => void;
+  postRemoveHook?: (next: CallbackWithoutResultAndOptionalError) => void;
 }
 
-interface SchemaWithMeiliMethods extends Model<DocumentWithMeiliIndex> {
+export type DocumentWithMeiliIndex = _DocumentWithMeiliIndex & IConversation & Partial<IMessage>;
+
+export interface SchemaWithMeiliMethods extends Model<DocumentWithMeiliIndex> {
   syncWithMeili(): Promise<void>;
+  getSyncProgress(): Promise<SyncProgress>;
+  processSyncBatch(
+    index: Index<MeiliIndexable>,
+    documents: Array<Record<string, unknown>>,
+  ): Promise<void>;
+  cleanupMeiliIndex(
+    index: Index<MeiliIndexable>,
+    primaryKey: string,
+    batchSize: number,
+    delayMs: number,
+  ): Promise<void>;
   setMeiliIndexSettings(settings: Record<string, unknown>): Promise<unknown>;
-  meiliSearch(q: string, params: Record<string, unknown>, populate: boolean): Promise<unknown>;
+  meiliSearch(
+    q: string,
+    params?: SearchParams,
+    populate?: boolean,
+  ): Promise<SearchResponse<MeiliIndexable, Record<string, unknown>>>;
 }
 
 // Environment flags
@@ -57,27 +83,12 @@ const meiliEnabled =
   process.env.MEILI_HOST != null && process.env.MEILI_MASTER_KEY != null && searchEnabled;
 
 /**
- * Local implementation of parseTextParts to avoid dependency on librechat-data-provider
- * Extracts text content from an array of content items
+ * Get sync configuration from environment variables
  */
-const parseTextParts = (content: ContentItem[]): string => {
-  if (!Array.isArray(content)) {
-    return '';
-  }
-
-  return content
-    .filter((item) => item.type === 'text' && typeof item.text === 'string')
-    .map((item) => item.text)
-    .join(' ')
-    .trim();
-};
-
-/**
- * Local implementation to handle Bing convoId conversion
- */
-const cleanUpPrimaryKeyValue = (value: string): string => {
-  return value.replace(/--/g, '|');
-};
+const getSyncConfig = () => ({
+  batchSize: parseInt(process.env.MEILI_SYNC_BATCH_SIZE || '100', 10),
+  delayMs: parseInt(process.env.MEILI_SYNC_DELAY_MS || '100', 10),
+});
 
 /**
  * Validates the required options for configuring the mongoMeili plugin.
@@ -92,6 +103,26 @@ const validateOptions = (options: Partial<MongoMeiliOptions>): void => {
 };
 
 /**
+ * Helper function to process documents in batches with rate limiting
+ */
+const processBatch = async <T>(
+  items: T[],
+  batchSize: number,
+  delayMs: number,
+  processor: (batch: T[]) => Promise<void>,
+): Promise<void> => {
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    await processor(batch);
+
+    // Add delay between batches to prevent overwhelming resources
+    if (i + batchSize < items.length && delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+};
+
+/**
  * Factory function to create a MeiliMongooseModel class which extends a Mongoose model.
  * This class contains static and instance methods to synchronize and manage the MeiliSearch index
  * corresponding to the MongoDB collection.
@@ -99,127 +130,200 @@ const validateOptions = (options: Partial<MongoMeiliOptions>): void => {
  * @param config - Configuration object.
  * @param config.index - The MeiliSearch index object.
  * @param config.attributesToIndex - List of attributes to index.
+ * @param config.syncOptions - Sync configuration options.
  * @returns A class definition that will be loaded into the Mongoose schema.
  */
 const createMeiliMongooseModel = ({
   index,
   attributesToIndex,
+  syncOptions,
 }: {
   index: Index<MeiliIndexable>;
   attributesToIndex: string[];
+  syncOptions: { batchSize: number; delayMs: number };
 }) => {
   const primaryKey = attributesToIndex[0];
+  const syncConfig = { ...getSyncConfig(), ...syncOptions };
 
   class MeiliMongooseModel {
     /**
-     * Synchronizes the data between the MongoDB collection and the MeiliSearch index.
-     *
-     * The synchronization process involves:
-     *   1. Fetching all documents from the MongoDB collection and MeiliSearch index.
-     *   2. Comparing documents from both sources.
-     *   3. Deleting documents from MeiliSearch that no longer exist in MongoDB.
-     *   4. Adding documents to MeiliSearch that exist in MongoDB but not in the index.
-     *   5. Updating documents in MeiliSearch if key fields (such as `text` or `title`) differ.
-     *   6. Updating the `_meiliIndex` field in MongoDB to indicate the indexing status.
-     *
-     * Note: The function processes documents in batches because MeiliSearch's
-     * `index.getDocuments` requires an exact limit and `index.addDocuments` does not handle
-     * partial failures in a batch.
-     *
-     * @returns {Promise<void>} Resolves when the synchronization is complete.
+     * Get the current sync progress
      */
+    static async getSyncProgress(this: SchemaWithMeiliMethods): Promise<SyncProgress> {
+      const totalDocuments = await this.countDocuments({ expiredAt: null });
+      const indexedDocuments = await this.countDocuments({ expiredAt: null, _meiliIndex: true });
+
+      return {
+        totalProcessed: indexedDocuments,
+        totalDocuments,
+        isComplete: indexedDocuments === totalDocuments,
+      };
+    }
+
+    /**
+     * Synchronizes data between the MongoDB collection and the MeiliSearch index by
+     * incrementally indexing only documents where `expiredAt` is `null` and `_meiliIndex` is not `true`
+     * (i.e., non-expired documents that have not yet been indexed, including those with missing or null `_meiliIndex`).
+     * */
     static async syncWithMeili(this: SchemaWithMeiliMethods): Promise<void> {
+      const startTime = Date.now();
+      const { batchSize, delayMs } = syncConfig;
+
+      const collectionName = primaryKey === 'messageId' ? 'messages' : 'conversations';
+      logger.info(
+        `[syncWithMeili] Starting sync for ${collectionName} with batch size ${batchSize}`,
+      );
+
+      // Get approximate total count for raw estimation, the sync should not overcome this number
+      const approxTotalCount = await this.estimatedDocumentCount();
+      logger.info(
+        `[syncWithMeili] Approximate total number of all ${collectionName}: ${approxTotalCount}`,
+      );
+
       try {
-        let moreDocuments = true;
-        const mongoDocuments = await this.find().lean();
+        // First, handle documents that need to be removed from Meili
+        logger.info(`[syncWithMeili] Starting cleanup of Meili index ${index.uid} before sync`);
+        await this.cleanupMeiliIndex(index, primaryKey, batchSize, delayMs);
+        logger.info(`[syncWithMeili] Completed cleanup of Meili index: ${index.uid}`);
+      } catch (error) {
+        logger.error('[syncWithMeili] Error during cleanup Meili before sync:', error);
+        throw error;
+      }
 
-        const format = (doc: Record<string, unknown>) =>
-          _.omitBy(_.pick(doc, attributesToIndex), (v, k) => k.startsWith('$'));
+      let processedCount = 0;
+      let hasMore = true;
 
-        const mongoMap = new Map(
-          mongoDocuments.map((doc) => {
-            const typedDoc = doc as Record<string, unknown>;
-            return [typedDoc[primaryKey], format(typedDoc)];
-          }),
+      while (hasMore) {
+        const query: FilterQuery<unknown> = {
+          expiredAt: null,
+          _meiliIndex: { $ne: true },
+        };
+
+        try {
+          const documents = await this.find(query)
+            .select(attributesToIndex.join(' ') + ' _meiliIndex')
+            .limit(batchSize)
+            .lean();
+
+          // Check if there are more documents to process
+          if (documents.length === 0) {
+            logger.info('[syncWithMeili] No more documents to process');
+            break;
+          }
+
+          // Process the batch
+          await this.processSyncBatch(index, documents);
+          processedCount += documents.length;
+          logger.info(`[syncWithMeili] Processed: ${processedCount}`);
+
+          if (documents.length < batchSize) {
+            hasMore = false;
+          }
+
+          // Add delay to prevent overwhelming resources
+          if (hasMore && delayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          }
+        } catch (error) {
+          logger.error('[syncWithMeili] Error processing documents batch:', error);
+          throw error;
+        }
+      }
+
+      const duration = Date.now() - startTime;
+      logger.info(
+        `[syncWithMeili] Completed sync for ${collectionName}. Processed ${processedCount} documents in ${duration}ms`,
+      );
+    }
+
+    /**
+     * Process a batch of documents for syncing
+     */
+    static async processSyncBatch(
+      this: SchemaWithMeiliMethods,
+      index: Index<MeiliIndexable>,
+      documents: Array<Record<string, unknown>>,
+    ): Promise<void> {
+      if (documents.length === 0) {
+        return;
+      }
+
+      // Format documents for MeiliSearch
+      const formattedDocs = documents.map((doc) =>
+        _.omitBy(_.pick(doc, attributesToIndex), (_v, k) => k.startsWith('$')),
+      );
+
+      try {
+        // Add documents to MeiliSearch
+        await index.addDocumentsInBatches(formattedDocs);
+
+        // Update MongoDB to mark documents as indexed.
+        // { timestamps: false } prevents Mongoose from touching updatedAt, preserving
+        // original conversation/message timestamps (fixes sidebar chronological sort).
+        const docsIds = documents.map((doc) => doc._id);
+        await this.updateMany(
+          { _id: { $in: docsIds } },
+          { $set: { _meiliIndex: true } },
+          { timestamps: false },
         );
-        const indexMap = new Map<unknown, Record<string, unknown>>();
+      } catch (error) {
+        logger.error('[processSyncBatch] Error processing batch:', error);
+        throw error;
+      }
+    }
+
+    /**
+     * Clean up documents in MeiliSearch that no longer exist in MongoDB
+     */
+    static async cleanupMeiliIndex(
+      this: SchemaWithMeiliMethods,
+      index: Index<MeiliIndexable>,
+      primaryKey: string,
+      batchSize: number,
+      delayMs: number,
+    ): Promise<void> {
+      try {
         let offset = 0;
-        const batchSize = 1000;
+        let moreDocuments = true;
 
         while (moreDocuments) {
           const batch = await index.getDocuments({ limit: batchSize, offset });
           if (batch.results.length === 0) {
             moreDocuments = false;
+            break;
           }
-          for (const doc of batch.results) {
-            indexMap.set(doc[primaryKey], format(doc));
-          }
-          offset += batchSize;
-        }
 
-        logger.debug('[syncWithMeili]', { indexMap: indexMap.size, mongoMap: mongoMap.size });
+          const meiliIds = batch.results.map((doc) => doc[primaryKey]);
+          const query: Record<string, unknown> = {};
+          query[primaryKey] = { $in: meiliIds };
 
-        const updateOps: Array<{
-          updateOne: {
-            filter: Record<string, unknown>;
-            update: { $set: { _meiliIndex: boolean } };
-          };
-        }> = [];
+          // Find which documents exist in MongoDB
+          const existingDocs = await this.find(query).select(primaryKey).lean();
 
-        // Process documents present in the MeiliSearch index
-        for (const [id, doc] of indexMap) {
-          const update: Record<string, unknown> = {};
-          update[primaryKey] = id;
-          if (mongoMap.has(id)) {
-            const mongoDoc = mongoMap.get(id);
-            if (
-              (doc.text && doc.text !== mongoDoc?.text) ||
-              (doc.title && doc.title !== mongoDoc?.title)
-            ) {
-              logger.debug(
-                `[syncWithMeili] ${id} had document discrepancy in ${
-                  doc.text ? 'text' : 'title'
-                } field`,
-              );
-              updateOps.push({
-                updateOne: { filter: update, update: { $set: { _meiliIndex: true } } },
-              });
-              await index.addDocuments([doc]);
-            }
-          } else {
-            await index.deleteDocument(id as string);
-            updateOps.push({
-              updateOne: { filter: update, update: { $set: { _meiliIndex: false } } },
-            });
-          }
-        }
-
-        // Process documents present in MongoDB
-        for (const [id, doc] of mongoMap) {
-          const update: Record<string, unknown> = {};
-          update[primaryKey] = id;
-          if (!indexMap.has(id)) {
-            await index.addDocuments([doc]);
-            updateOps.push({
-              updateOne: { filter: update, update: { $set: { _meiliIndex: true } } },
-            });
-          } else if (doc._meiliIndex === false) {
-            updateOps.push({
-              updateOne: { filter: update, update: { $set: { _meiliIndex: true } } },
-            });
-          }
-        }
-
-        if (updateOps.length > 0) {
-          await this.collection.bulkWrite(updateOps);
-          logger.debug(
-            `[syncWithMeili] Finished indexing ${
-              primaryKey === 'messageId' ? 'messages' : 'conversations'
-            }`,
+          const existingIds = new Set(
+            existingDocs.map((doc: Record<string, unknown>) => doc[primaryKey]),
           );
+
+          // Delete documents that don't exist in MongoDB
+          const toDelete = meiliIds.filter((id) => !existingIds.has(id));
+          if (toDelete.length > 0) {
+            await index.deleteDocuments(toDelete.map(String));
+            logger.debug(`[cleanupMeiliIndex] Deleted ${toDelete.length} orphaned documents`);
+          }
+          // if fetch documents request returns less documents than limit, all documents are processed
+          if (batch.results.length < batchSize) {
+            break;
+          }
+
+          offset += batchSize - toDelete.length;
+
+          // Add delay between batches
+          if (delayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          }
         }
       } catch (error) {
-        logger.error('[syncWithMeili] Error adding document to Meili', error);
+        logger.error('[cleanupMeiliIndex] Error during cleanup:', error);
       }
     }
 
@@ -236,16 +340,14 @@ const createMeiliMongooseModel = ({
     static async meiliSearch(
       this: SchemaWithMeiliMethods,
       q: string,
-      params: Record<string, unknown>,
+      params: SearchParams,
       populate: boolean,
-    ): Promise<unknown> {
+    ): Promise<SearchResponse<MeiliIndexable, Record<string, unknown>>> {
       const data = await index.search(q, params);
 
       if (populate) {
         const query: Record<string, unknown> = {};
-        query[primaryKey] = _.map(data.hits, (hit) =>
-          cleanUpPrimaryKeyValue(hit[primaryKey] as string),
-        );
+        query[primaryKey] = _.map(data.hits, (hit) => hit[primaryKey]);
 
         const projection = Object.keys(this.schema.obj).reduce<Record<string, number>>(
           (results, key) => {
@@ -303,30 +405,66 @@ const createMeiliMongooseModel = ({
     }
 
     /**
-     * Adds the current document to the MeiliSearch index
+     * Adds the current document to the MeiliSearch index with retry logic
      */
-    async addObjectToMeili(this: DocumentWithMeiliIndex): Promise<void> {
-      const object = this.preprocessObjectForIndex!();
-      try {
-        await index.addDocuments([object]);
-      } catch (error) {
-        logger.error('[addObjectToMeili] Error adding document to Meili', error);
+    async addObjectToMeili(
+      this: DocumentWithMeiliIndex,
+      next: CallbackWithoutResultAndOptionalError,
+    ): Promise<void> {
+      // If this conversation or message has a TTL, don't index it
+      if (!_.isNil(this.expiredAt)) {
+        return next();
       }
 
-      await this.collection.updateMany(
-        { _id: this._id as mongoose.Types.ObjectId },
-        { $set: { _meiliIndex: true } },
-      );
+      const object = this.preprocessObjectForIndex!();
+      const maxRetries = 3;
+      let retryCount = 0;
+
+      while (retryCount < maxRetries) {
+        try {
+          await index.addDocuments([object]);
+          break;
+        } catch (error) {
+          retryCount++;
+          if (retryCount >= maxRetries) {
+            logger.error('[addObjectToMeili] Error adding document to Meili after retries:', error);
+            return next();
+          }
+          // Exponential backoff
+          await new Promise((resolve) => setTimeout(resolve, Math.pow(2, retryCount) * 1000));
+        }
+      }
+
+      try {
+        await this.collection.updateMany(
+          { _id: this._id as Types.ObjectId },
+          { $set: { _meiliIndex: true } },
+        );
+      } catch (error) {
+        logger.error('[addObjectToMeili] Error updating _meiliIndex field:', error);
+        return next();
+      }
+
+      next();
     }
 
     /**
      * Updates the current document in the MeiliSearch index
      */
-    async updateObjectToMeili(this: DocumentWithMeiliIndex): Promise<void> {
-      const object = _.omitBy(_.pick(this.toJSON(), attributesToIndex), (v, k) =>
-        k.startsWith('$'),
-      );
-      await index.updateDocuments([object]);
+    async updateObjectToMeili(
+      this: DocumentWithMeiliIndex,
+      next: CallbackWithoutResultAndOptionalError,
+    ): Promise<void> {
+      try {
+        const object = _.omitBy(_.pick(this.toJSON(), attributesToIndex), (v, k) =>
+          k.startsWith('$'),
+        );
+        await index.updateDocuments([object]);
+        next();
+      } catch (error) {
+        logger.error('[updateObjectToMeili] Error updating document in Meili:', error);
+        return next();
+      }
     }
 
     /**
@@ -334,8 +472,17 @@ const createMeiliMongooseModel = ({
      *
      * @returns {Promise<void>}
      */
-    async deleteObjectFromMeili(this: DocumentWithMeiliIndex): Promise<void> {
-      await index.deleteDocument(this._id as string);
+    async deleteObjectFromMeili(
+      this: DocumentWithMeiliIndex,
+      next: CallbackWithoutResultAndOptionalError,
+    ): Promise<void> {
+      try {
+        await index.deleteDocument(this._id as string);
+        next();
+      } catch (error) {
+        logger.error('[deleteObjectFromMeili] Error deleting document from Meili:', error);
+        return next();
+      }
     }
 
     /**
@@ -344,11 +491,11 @@ const createMeiliMongooseModel = ({
      * If the document is already indexed (i.e. `_meiliIndex` is true), it updates it;
      * otherwise, it adds the document to the index.
      */
-    postSaveHook(this: DocumentWithMeiliIndex): void {
+    postSaveHook(this: DocumentWithMeiliIndex, next: CallbackWithoutResultAndOptionalError): void {
       if (this._meiliIndex) {
-        this.updateObjectToMeili!();
+        this.updateObjectToMeili!(next);
       } else {
-        this.addObjectToMeili!();
+        this.addObjectToMeili!(next);
       }
     }
 
@@ -358,9 +505,14 @@ const createMeiliMongooseModel = ({
      * This hook is triggered after a document update, ensuring that changes are
      * propagated to the MeiliSearch index if the document is indexed.
      */
-    postUpdateHook(this: DocumentWithMeiliIndex): void {
+    postUpdateHook(
+      this: DocumentWithMeiliIndex,
+      next: CallbackWithoutResultAndOptionalError,
+    ): void {
       if (this._meiliIndex) {
-        this.updateObjectToMeili!();
+        this.updateObjectToMeili!(next);
+      } else {
+        next();
       }
     }
 
@@ -370,9 +522,14 @@ const createMeiliMongooseModel = ({
      * This hook is triggered after a document is removed, ensuring that the document
      * is also removed from the MeiliSearch index if it was previously indexed.
      */
-    postRemoveHook(this: DocumentWithMeiliIndex): void {
+    postRemoveHook(
+      this: DocumentWithMeiliIndex,
+      next: CallbackWithoutResultAndOptionalError,
+    ): void {
       if (this._meiliIndex) {
-        this.deleteObjectFromMeili!();
+        this.deleteObjectFromMeili!(next);
+      } else {
+        next();
       }
     }
   }
@@ -396,8 +553,11 @@ const createMeiliMongooseModel = ({
  * @param options.apiKey - The MeiliSearch API key.
  * @param options.indexName - The name of the MeiliSearch index.
  * @param options.primaryKey - The primary key field for indexing.
+ * @param options.syncBatchSize - Batch size for sync operations.
+ * @param options.syncDelayMs - Delay between batches in milliseconds.
  */
 export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): void {
+  const mongoose = options.mongoose;
   validateOptions(options);
 
   // Add _meiliIndex field to the schema to track if a document has been indexed in MeiliSearch.
@@ -411,10 +571,47 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
   });
 
   const { host, apiKey, indexName, primaryKey } = options;
+  const syncOptions = {
+    batchSize: options.syncBatchSize || getSyncConfig().batchSize,
+    delayMs: options.syncDelayMs || getSyncConfig().delayMs,
+  };
 
   const client = new MeiliSearch({ host, apiKey });
-  client.createIndex(indexName, { primaryKey });
+
+  /** Create index only if it doesn't exist */
   const index = client.index<MeiliIndexable>(indexName);
+
+  // Check if index exists and create if needed
+  (async () => {
+    try {
+      await index.getRawInfo();
+      logger.debug(`[mongoMeili] Index ${indexName} already exists`);
+    } catch (error) {
+      const errorCode = (error as { code?: string })?.code;
+      if (errorCode === 'index_not_found') {
+        try {
+          logger.info(`[mongoMeili] Creating new index: ${indexName}`);
+          await client.createIndex(indexName, { primaryKey });
+          logger.info(`[mongoMeili] Successfully created index: ${indexName}`);
+        } catch (createError) {
+          // Index might have been created by another instance
+          logger.debug(`[mongoMeili] Index ${indexName} may already exist:`, createError);
+        }
+      } else {
+        logger.error(`[mongoMeili] Error checking index ${indexName}:`, error);
+      }
+    }
+
+    // Configure index settings to make 'user' field filterable
+    try {
+      await index.updateSettings({
+        filterableAttributes: ['user'],
+      });
+      logger.debug(`[mongoMeili] Updated index ${indexName} settings to make 'user' filterable`);
+    } catch (settingsError) {
+      logger.error(`[mongoMeili] Error updating index settings for ${indexName}:`, settingsError);
+    }
+  })();
 
   // Collect attributes from the schema that should be indexed
   const attributesToIndex: string[] = [
@@ -424,19 +621,26 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
     }, []),
   ];
 
-  schema.loadClass(createMeiliMongooseModel({ index, attributesToIndex }));
+  // CRITICAL: Always include 'user' field for proper filtering
+  // This ensures existing deployments can filter by user after migration
+  if (schema.obj.user && !attributesToIndex.includes('user')) {
+    attributesToIndex.push('user');
+    logger.debug(`[mongoMeili] Added 'user' field to ${indexName} index attributes`);
+  }
+
+  schema.loadClass(createMeiliMongooseModel({ index, attributesToIndex, syncOptions }));
 
   // Register Mongoose hooks
-  schema.post('save', function (doc: DocumentWithMeiliIndex) {
-    doc.postSaveHook?.();
+  schema.post('save', function (doc: DocumentWithMeiliIndex, next) {
+    doc.postSaveHook?.(next);
   });
 
-  schema.post('updateOne', function (doc: DocumentWithMeiliIndex) {
-    doc.postUpdateHook?.();
+  schema.post('updateOne', function (doc: DocumentWithMeiliIndex, next) {
+    doc.postUpdateHook?.(next);
   });
 
-  schema.post('deleteOne', function (doc: DocumentWithMeiliIndex) {
-    doc.postRemoveHook?.();
+  schema.post('deleteOne', function (doc: DocumentWithMeiliIndex, next) {
+    doc.postRemoveHook?.(next);
   });
 
   // Pre-deleteMany hook: remove corresponding documents from MeiliSearch when multiple documents are deleted.
@@ -447,35 +651,46 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
 
     try {
       const conditions = (this as Query<unknown, unknown>).getQuery();
+      const { batchSize, delayMs } = syncOptions;
 
       if (Object.prototype.hasOwnProperty.call(schema.obj, 'messages')) {
         const convoIndex = client.index('convos');
         const deletedConvos = await mongoose
           .model('Conversation')
-          .find(conditions as mongoose.FilterQuery<unknown>)
+          .find(conditions as FilterQuery<unknown>)
+          .select('conversationId')
           .lean();
-        const promises = deletedConvos.map((convo: Record<string, unknown>) =>
-          convoIndex.deleteDocument(convo.conversationId as string),
-        );
-        await Promise.all(promises);
+
+        // Process deletions in batches
+        await processBatch(deletedConvos, batchSize, delayMs, async (batch) => {
+          const promises = batch.map((convo: Record<string, unknown>) =>
+            convoIndex.deleteDocument(convo.conversationId as string),
+          );
+          await Promise.all(promises);
+        });
       }
 
       if (Object.prototype.hasOwnProperty.call(schema.obj, 'messageId')) {
         const messageIndex = client.index('messages');
         const deletedMessages = await mongoose
           .model('Message')
-          .find(conditions as mongoose.FilterQuery<unknown>)
+          .find(conditions as FilterQuery<unknown>)
+          .select('messageId')
           .lean();
-        const promises = deletedMessages.map((message: Record<string, unknown>) =>
-          messageIndex.deleteDocument(message.messageId as string),
-        );
-        await Promise.all(promises);
+
+        // Process deletions in batches
+        await processBatch(deletedMessages, batchSize, delayMs, async (batch) => {
+          const promises = batch.map((message: Record<string, unknown>) =>
+            messageIndex.deleteDocument(message.messageId as string),
+          );
+          await Promise.all(promises);
+        });
       }
       return next();
     } catch (error) {
       if (meiliEnabled) {
         logger.error(
-          '[MeiliMongooseModel.deleteMany] There was an issue deleting conversation indexes upon deletion. Next startup may be slow due to syncing.',
+          '[MeiliMongooseModel.deleteMany] There was an issue deleting conversation indexes upon deletion. Next startup may trigger syncing.',
           error,
         );
       }
@@ -484,13 +699,13 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
   });
 
   // Post-findOneAndUpdate hook
-  schema.post('findOneAndUpdate', async function (doc: DocumentWithMeiliIndex) {
+  schema.post('findOneAndUpdate', async function (doc: DocumentWithMeiliIndex, next) {
     if (!meiliEnabled) {
-      return;
+      return next();
     }
 
     if (doc.unfinished) {
-      return;
+      return next();
     }
 
     let meiliDoc: Record<string, unknown> | undefined;
@@ -507,9 +722,9 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
     }
 
     if (meiliDoc && meiliDoc.title === doc.title) {
-      return;
+      return next();
     }
 
-    doc.postSaveHook?.();
+    doc.postSaveHook?.(next);
   });
 }

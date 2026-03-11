@@ -1,28 +1,32 @@
 import React, { useMemo, useEffect } from 'react';
+import keyBy from 'lodash/keyBy';
+import { ControlCombobox } from '@librechat/client';
 import { ChevronLeft, RotateCcw } from 'lucide-react';
 import { useFormContext, useWatch, Controller } from 'react-hook-form';
+import { componentMapping } from '~/components/SidePanel/Parameters/components';
 import {
   alternateName,
   getSettingsKeys,
+  getEndpointField,
+  LocalStorageKeys,
   SettingDefinition,
   agentParamSettings,
 } from 'librechat-data-provider';
 import type * as t from 'librechat-data-provider';
 import type { AgentForm, AgentModelPanelProps, StringOption } from '~/common';
-import { componentMapping } from '~/components/SidePanel/Parameters/components';
-import ControlCombobox from '~/components/ui/ControlCombobox';
 import { useGetEndpointsQuery } from '~/data-provider';
-import { getEndpointField, cn } from '~/utils';
+import { useLiveAnnouncer } from '~/Providers';
 import { useLocalize } from '~/hooks';
 import { Panel } from '~/common';
-import keyBy from 'lodash/keyBy';
+import { cn } from '~/utils';
 
 export default function ModelPanel({
-  setActivePanel,
   providers,
+  setActivePanel,
   models: modelsData,
-}: AgentModelPanelProps) {
+}: Pick<AgentModelPanelProps, 'models' | 'providers' | 'setActivePanel'>) {
   const localize = useLocalize();
+  const { announcePolite } = useLiveAnnouncer();
 
   const { control, setValue } = useFormContext<AgentForm>();
 
@@ -50,6 +54,8 @@ export default function ModelPanel({
         const newModels = modelsData[provider] ?? [];
         setValue('model', newModels[0] ?? '');
       }
+      localStorage.setItem(LocalStorageKeys.LAST_AGENT_MODEL, _model);
+      localStorage.setItem(LocalStorageKeys.LAST_AGENT_PROVIDER, provider);
     }
 
     if (provider && !_model) {
@@ -76,9 +82,9 @@ export default function ModelPanel({
       agentParamSettings[combinedKey] ?? agentParamSettings[overriddenEndpointKey] ?? [];
     const overriddenParams = endpointsConfig[provider]?.customParams?.paramDefinitions ?? [];
     const overriddenParamsMap = keyBy(overriddenParams, 'key');
-    return defaultParams.map(
-      (param) => (overriddenParamsMap[param.key] as SettingDefinition) ?? param,
-    );
+    return defaultParams
+      .filter((param) => param != null)
+      .map((param) => (overriddenParamsMap[param.key] as SettingDefinition) ?? param);
   }, [endpointType, endpointsConfig, model, provider]);
 
   const setOption = (optionKey: keyof t.AgentModelParameters) => (value: t.AgentParameterValue) => {
@@ -87,6 +93,7 @@ export default function ModelPanel({
 
   const handleResetParameters = () => {
     setValue('model_parameters', {} as t.AgentModelParameters);
+    announcePolite({ message: localize('com_ui_model_parameters_reset'), isStatus: true });
   };
 
   return (
@@ -99,6 +106,7 @@ export default function ModelPanel({
             onClick={() => {
               setActivePanel(Panel.builder);
             }}
+            aria-label={localize('com_ui_back_to_builder')}
           >
             <div className="model-panel-content flex w-full items-center justify-center gap-2">
               <ChevronLeft />

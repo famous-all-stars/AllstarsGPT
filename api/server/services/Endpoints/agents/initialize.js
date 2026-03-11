@@ -1,353 +1,379 @@
-const { createContentAggregator, Providers } = require('@librechat/agents');
+const { logger } = require('@librechat/data-schemas');
+const { createContentAggregator } = require('@librechat/agents');
 const {
-  Constants,
-  ErrorTypes,
+  initializeAgent,
+  validateAgentModel,
+  createEdgeCollector,
+  filterOrphanedEdges,
+  GenerationJobManager,
+  getCustomEndpointConfig,
+  createSequentialChainEdges,
+} = require('@librechat/api');
+const {
   EModelEndpoint,
-  EToolResources,
+  isAgentsEndpoint,
   getResponseSender,
-  AgentCapabilities,
-  replaceSpecialVars,
-  providerEndpointMap,
+  isEphemeralAgentId,
 } = require('librechat-data-provider');
 const {
-  getDefaultHandlers,
   createToolEndCallback,
+  getDefaultHandlers,
 } = require('~/server/controllers/agents/callbacks');
-const initAnthropic = require('~/server/services/Endpoints/anthropic/initialize');
-const getBedrockOptions = require('~/server/services/Endpoints/bedrock/options');
-const initOpenAI = require('~/server/services/Endpoints/openAI/initialize');
-const initCustom = require('~/server/services/Endpoints/custom/initialize');
-const initGoogle = require('~/server/services/Endpoints/google/initialize');
-const generateArtifactsPrompt = require('~/app/clients/prompts/artifacts');
-const { getCustomEndpointConfig } = require('~/server/services/Config');
-const { processFiles } = require('~/server/services/Files/process');
-const { loadAgentTools } = require('~/server/services/ToolService');
+const { loadAgentTools, loadToolsForExecution } = require('~/server/services/ToolService');
+const { getModelsConfig } = require('~/server/controllers/ModelController');
 const AgentClient = require('~/server/controllers/agents/client');
 const { getConvoFiles } = require('~/models/Conversation');
-const { getToolFilesByIds } = require('~/models/File');
-const { getModelMaxTokens } = require('~/utils');
+const { processAddedConvo } = require('./addedConvo');
 const { getAgent } = require('~/models/Agent');
-const { getFiles } = require('~/models/File');
-const { logger } = require('~/config');
-
-const providerConfigMap = {
-  [Providers.XAI]: initCustom,
-  [Providers.OLLAMA]: initCustom,
-  [Providers.DEEPSEEK]: initCustom,
-  [Providers.OPENROUTER]: initCustom,
-  [EModelEndpoint.openAI]: initOpenAI,
-  [EModelEndpoint.google]: initGoogle,
-  [EModelEndpoint.azureOpenAI]: initOpenAI,
-  [EModelEndpoint.anthropic]: initAnthropic,
-  [EModelEndpoint.bedrock]: getBedrockOptions,
-};
+const { logViolation } = require('~/cache');
+const db = require('~/models');
 
 /**
- * @param {Object} params
- * @param {ServerRequest} params.req
- * @param {Promise<Array<MongoFile | null>> | undefined} [params.attachments]
- * @param {Set<string>} params.requestFileSet
- * @param {AgentToolResources | undefined} [params.tool_resources]
- * @returns {Promise<{ attachments: Array<MongoFile | undefined> | undefined, tool_resources: AgentToolResources | undefined }>}
+ * Creates a tool loader function for the agent.
+ * @param {AbortSignal} signal - The abort signal
+ * @param {string | null} [streamId] - The stream ID for resumable mode
+ * @param {boolean} [definitionsOnly=false] - When true, returns only serializable
+ *   tool definitions without creating full tool instances (for event-driven mode)
  */
-const primeResources = async ({
-  req,
-  attachments: _attachments,
-  tool_resources: _tool_resources,
-  requestFileSet,
-}) => {
-  try {
-    /** @type {Array<MongoFile | undefined> | undefined} */
-    let attachments;
-    const tool_resources = _tool_resources ?? {};
-    const isOCREnabled = (req.app.locals?.[EModelEndpoint.agents]?.capabilities ?? []).includes(
-      AgentCapabilities.ocr,
-    );
-    if (tool_resources[EToolResources.ocr]?.file_ids && isOCREnabled) {
-      const context = await getFiles(
-        {
-          file_id: { $in: tool_resources.ocr.file_ids },
-        },
-        {},
-        {},
-      );
-      attachments = (attachments ?? []).concat(context);
+function createToolLoader(signal, streamId = null, definitionsOnly = false) {
+  /**
+   * @param {object} params
+   * @param {ServerRequest} params.req
+   * @param {ServerResponse} params.res
+   * @param {string} params.agentId
+   * @param {string[]} params.tools
+   * @param {string} params.provider
+   * @param {string} params.model
+   * @param {AgentToolResources} params.tool_resources
+   * @returns {Promise<{
+   *   tools?: StructuredTool[],
+   *   toolContextMap: Record<string, unknown>,
+   *   toolDefinitions?: import('@librechat/agents').LCTool[],
+   *   userMCPAuthMap?: Record<string, Record<string, string>>,
+   *   toolRegistry?: import('@librechat/agents').LCToolRegistry
+   * } | undefined>}
+   */
+  return async function loadTools({
+    req,
+    res,
+    tools,
+    model,
+    agentId,
+    provider,
+    tool_options,
+    tool_resources,
+  }) {
+    const agent = { id: agentId, tools, provider, model, tool_options };
+    try {
+      return await loadAgentTools({
+        req,
+        res,
+        agent,
+        signal,
+        streamId,
+        tool_resources,
+        definitionsOnly,
+      });
+    } catch (error) {
+      logger.error('Error loading tools for agent ' + agentId, error);
     }
-    if (!_attachments) {
-      return { attachments, tool_resources };
-    }
-    /** @type {Array<MongoFile | undefined> | undefined} */
-    const files = await _attachments;
-    if (!attachments) {
-      /** @type {Array<MongoFile | undefined>} */
-      attachments = [];
-    }
-
-    for (const file of files) {
-      if (!file) {
-        continue;
-      }
-      if (file.metadata?.fileIdentifier) {
-        const execute_code = tool_resources[EToolResources.execute_code] ?? {};
-        if (!execute_code.files) {
-          tool_resources[EToolResources.execute_code] = { ...execute_code, files: [] };
-        }
-        tool_resources[EToolResources.execute_code].files.push(file);
-      } else if (file.embedded === true) {
-        const file_search = tool_resources[EToolResources.file_search] ?? {};
-        if (!file_search.files) {
-          tool_resources[EToolResources.file_search] = { ...file_search, files: [] };
-        }
-        tool_resources[EToolResources.file_search].files.push(file);
-      } else if (
-        requestFileSet.has(file.file_id) &&
-        file.type.startsWith('image') &&
-        file.height &&
-        file.width
-      ) {
-        const image_edit = tool_resources[EToolResources.image_edit] ?? {};
-        if (!image_edit.files) {
-          tool_resources[EToolResources.image_edit] = { ...image_edit, files: [] };
-        }
-        tool_resources[EToolResources.image_edit].files.push(file);
-      }
-
-      attachments.push(file);
-    }
-    return { attachments, tool_resources };
-  } catch (error) {
-    logger.error('Error priming resources', error);
-    return { attachments: _attachments, tool_resources: _tool_resources };
-  }
-};
-
-/**
- * @param  {...string | number} values
- * @returns {string | number | undefined}
- */
-function optionalChainWithEmptyCheck(...values) {
-  for (const value of values) {
-    if (value !== undefined && value !== null && value !== '') {
-      return value;
-    }
-  }
-  return values[values.length - 1];
+  };
 }
 
-/**
- * @param {object} params
- * @param {ServerRequest} params.req
- * @param {ServerResponse} params.res
- * @param {Agent} params.agent
- * @param {Set<string>} [params.allowedProviders]
- * @param {object} [params.endpointOption]
- * @param {boolean} [params.isInitialAgent]
- * @returns {Promise<Agent>}
- */
-const initializeAgentOptions = async ({
-  req,
-  res,
-  agent,
-  endpointOption,
-  allowedProviders,
-  isInitialAgent = false,
-}) => {
-  if (allowedProviders.size > 0 && !allowedProviders.has(agent.provider)) {
-    throw new Error(
-      `{ "type": "${ErrorTypes.INVALID_AGENT_PROVIDER}", "info": "${agent.provider}" }`,
-    );
-  }
-  let currentFiles;
-  /** @type {Array<MongoFile>} */
-  const requestFiles = req.body.files ?? [];
-  if (
-    isInitialAgent &&
-    req.body.conversationId != null &&
-    (agent.model_parameters?.resendFiles ?? true) === true
-  ) {
-    const fileIds = (await getConvoFiles(req.body.conversationId)) ?? [];
-    /** @type {Set<EToolResources>} */
-    const toolResourceSet = new Set();
-    for (const tool of agent.tools) {
-      if (EToolResources[tool]) {
-        toolResourceSet.add(EToolResources[tool]);
-      }
-    }
-    const toolFiles = await getToolFilesByIds(fileIds, toolResourceSet);
-    if (requestFiles.length || toolFiles.length) {
-      currentFiles = await processFiles(requestFiles.concat(toolFiles));
-    }
-  } else if (isInitialAgent && requestFiles.length) {
-    currentFiles = await processFiles(requestFiles);
-  }
-
-  const { attachments, tool_resources } = await primeResources({
-    req,
-    attachments: currentFiles,
-    tool_resources: agent.tool_resources,
-    requestFileSet: new Set(requestFiles.map((file) => file.file_id)),
-  });
-
-  const provider = agent.provider;
-  const { tools, toolContextMap } = await loadAgentTools({
-    req,
-    res,
-    agent: {
-      id: agent.id,
-      tools: agent.tools,
-      provider,
-      model: agent.model,
-    },
-    tool_resources,
-  });
-
-  agent.endpoint = provider;
-  let getOptions = providerConfigMap[provider];
-  if (!getOptions && providerConfigMap[provider.toLowerCase()] != null) {
-    agent.provider = provider.toLowerCase();
-    getOptions = providerConfigMap[agent.provider];
-  } else if (!getOptions) {
-    const customEndpointConfig = await getCustomEndpointConfig(provider);
-    if (!customEndpointConfig) {
-      throw new Error(`Provider ${provider} not supported`);
-    }
-    getOptions = initCustom;
-    agent.provider = Providers.OPENAI;
-  }
-  const model_parameters = Object.assign(
-    {},
-    agent.model_parameters ?? { model: agent.model },
-    isInitialAgent === true ? endpointOption?.model_parameters : {},
-  );
-  const _endpointOption =
-    isInitialAgent === true
-      ? Object.assign({}, endpointOption, { model_parameters })
-      : { model_parameters };
-
-  const options = await getOptions({
-    req,
-    res,
-    optionsOnly: true,
-    overrideEndpoint: provider,
-    overrideModel: agent.model,
-    endpointOption: _endpointOption,
-  });
-
-  if (
-    agent.endpoint === EModelEndpoint.azureOpenAI &&
-    options.llmConfig?.azureOpenAIApiInstanceName == null
-  ) {
-    agent.provider = Providers.OPENAI;
-  }
-
-  if (options.provider != null) {
-    agent.provider = options.provider;
-  }
-
-  /** @type {import('@librechat/agents').ClientOptions} */
-  agent.model_parameters = Object.assign(model_parameters, options.llmConfig);
-  if (options.configOptions) {
-    agent.model_parameters.configuration = options.configOptions;
-  }
-
-  if (!agent.model_parameters.model) {
-    agent.model_parameters.model = agent.model;
-  }
-
-  if (agent.instructions && agent.instructions !== '') {
-    agent.instructions = replaceSpecialVars({
-      text: agent.instructions,
-      user: req.user,
-    });
-  }
-
-  if (typeof agent.artifacts === 'string' && agent.artifacts !== '') {
-    agent.additional_instructions = generateArtifactsPrompt({
-      endpoint: agent.provider,
-      artifacts: agent.artifacts,
-    });
-  }
-
-  const tokensModel =
-    agent.provider === EModelEndpoint.azureOpenAI ? agent.model : agent.model_parameters.model;
-  const maxTokens = optionalChainWithEmptyCheck(
-    agent.model_parameters.maxOutputTokens,
-    agent.model_parameters.maxTokens,
-    0,
-  );
-  const maxContextTokens = optionalChainWithEmptyCheck(
-    agent.model_parameters.maxContextTokens,
-    agent.max_context_tokens,
-    getModelMaxTokens(tokensModel, providerEndpointMap[provider]),
-    4096,
-  );
-  return {
-    ...agent,
-    tools,
-    attachments,
-    toolContextMap,
-    maxContextTokens: (maxContextTokens - maxTokens) * 0.9,
-  };
-};
-
-const initializeClient = async ({ req, res, endpointOption }) => {
+const initializeClient = async ({ req, res, signal, endpointOption }) => {
   if (!endpointOption) {
     throw new Error('Endpoint option not provided');
   }
+  const appConfig = req.config;
 
-  // TODO: use endpointOption to determine options/modelOptions
+  /** @type {string | null} */
+  const streamId = req._resumableStreamId || null;
+
   /** @type {Array<UsageMetadata>} */
   const collectedUsage = [];
   /** @type {ArtifactPromises} */
   const artifactPromises = [];
   const { contentParts, aggregateContent } = createContentAggregator();
-  const toolEndCallback = createToolEndCallback({ req, res, artifactPromises });
+  const toolEndCallback = createToolEndCallback({ req, res, artifactPromises, streamId });
+
+  /**
+   * Agent context store - populated after initialization, accessed by callback via closure.
+   * Maps agentId -> { userMCPAuthMap, agent, tool_resources, toolRegistry, openAIApiKey }
+   * @type {Map<string, {
+   *   userMCPAuthMap?: Record<string, Record<string, string>>,
+   *   agent?: object,
+   *   tool_resources?: object,
+   *   toolRegistry?: import('@librechat/agents').LCToolRegistry,
+   *   openAIApiKey?: string
+   * }>}
+   */
+  const agentToolContexts = new Map();
+
+  const toolExecuteOptions = {
+    loadTools: async (toolNames, agentId) => {
+      const ctx = agentToolContexts.get(agentId) ?? {};
+      logger.debug(`[ON_TOOL_EXECUTE] ctx found: ${!!ctx.userMCPAuthMap}, agent: ${ctx.agent?.id}`);
+      logger.debug(`[ON_TOOL_EXECUTE] toolRegistry size: ${ctx.toolRegistry?.size ?? 'undefined'}`);
+
+      const result = await loadToolsForExecution({
+        req,
+        res,
+        signal,
+        streamId,
+        toolNames,
+        agent: ctx.agent,
+        toolRegistry: ctx.toolRegistry,
+        userMCPAuthMap: ctx.userMCPAuthMap,
+        tool_resources: ctx.tool_resources,
+      });
+
+      logger.debug(`[ON_TOOL_EXECUTE] loaded ${result.loadedTools?.length ?? 0} tools`);
+      return result;
+    },
+    toolEndCallback,
+  };
+
   const eventHandlers = getDefaultHandlers({
     res,
+    toolExecuteOptions,
     aggregateContent,
     toolEndCallback,
     collectedUsage,
+    streamId,
   });
 
   if (!endpointOption.agent) {
     throw new Error('No agent promise provided');
   }
 
-  // Initialize primary agent
   const primaryAgent = await endpointOption.agent;
+  delete endpointOption.agent;
   if (!primaryAgent) {
     throw new Error('Agent not found');
   }
 
-  const agentConfigs = new Map();
-  /** @type {Set<string>} */
-  const allowedProviders = new Set(req?.app?.locals?.[EModelEndpoint.agents]?.allowedProviders);
-
-  // Handle primary agent
-  const primaryConfig = await initializeAgentOptions({
+  const modelsConfig = await getModelsConfig(req);
+  const validationResult = await validateAgentModel({
     req,
     res,
+    modelsConfig,
+    logViolation,
     agent: primaryAgent,
-    endpointOption,
-    allowedProviders,
-    isInitialAgent: true,
+  });
+
+  if (!validationResult.isValid) {
+    throw new Error(validationResult.error?.message);
+  }
+
+  const agentConfigs = new Map();
+  const allowedProviders = new Set(appConfig?.endpoints?.[EModelEndpoint.agents]?.allowedProviders);
+
+  /** Event-driven mode: only load tool definitions, not full instances */
+  const loadTools = createToolLoader(signal, streamId, true);
+  /** @type {Array<MongoFile>} */
+  const requestFiles = req.body.files ?? [];
+  /** @type {string} */
+  const conversationId = req.body.conversationId;
+  /** @type {string | undefined} */
+  const parentMessageId = req.body.parentMessageId;
+
+  const primaryConfig = await initializeAgent(
+    {
+      req,
+      res,
+      loadTools,
+      requestFiles,
+      conversationId,
+      parentMessageId,
+      agent: primaryAgent,
+      endpointOption,
+      allowedProviders,
+      isInitialAgent: true,
+    },
+    {
+      getConvoFiles,
+      getFiles: db.getFiles,
+      getUserKey: db.getUserKey,
+      getMessages: db.getMessages,
+      updateFilesUsage: db.updateFilesUsage,
+      getUserKeyValues: db.getUserKeyValues,
+      getUserCodeFiles: db.getUserCodeFiles,
+      getToolFilesByIds: db.getToolFilesByIds,
+      getCodeGeneratedFiles: db.getCodeGeneratedFiles,
+    },
+  );
+
+  logger.debug(
+    `[initializeClient] Storing tool context for ${primaryConfig.id}: ${primaryConfig.toolDefinitions?.length ?? 0} tools, registry size: ${primaryConfig.toolRegistry?.size ?? '0'}`,
+  );
+  agentToolContexts.set(primaryConfig.id, {
+    agent: primaryAgent,
+    toolRegistry: primaryConfig.toolRegistry,
+    userMCPAuthMap: primaryConfig.userMCPAuthMap,
+    tool_resources: primaryConfig.tool_resources,
   });
 
   const agent_ids = primaryConfig.agent_ids;
-  if (agent_ids?.length) {
-    for (const agentId of agent_ids) {
-      const agent = await getAgent({ id: agentId });
-      if (!agent) {
-        throw new Error(`Agent ${agentId} not found`);
-      }
-      const config = await initializeAgentOptions({
+  let userMCPAuthMap = primaryConfig.userMCPAuthMap;
+
+  /** @type {Set<string>} Track agents that failed to load (orphaned references) */
+  const skippedAgentIds = new Set();
+
+  async function processAgent(agentId) {
+    const agent = await getAgent({ id: agentId });
+    if (!agent) {
+      logger.warn(
+        `[processAgent] Handoff agent ${agentId} not found, skipping (orphaned reference)`,
+      );
+      skippedAgentIds.add(agentId);
+      return null;
+    }
+
+    const validationResult = await validateAgentModel({
+      req,
+      res,
+      agent,
+      modelsConfig,
+      logViolation,
+    });
+
+    if (!validationResult.isValid) {
+      throw new Error(validationResult.error?.message);
+    }
+
+    const config = await initializeAgent(
+      {
         req,
         res,
         agent,
+        loadTools,
+        requestFiles,
+        conversationId,
+        parentMessageId,
         endpointOption,
         allowedProviders,
+      },
+      {
+        getConvoFiles,
+        getFiles: db.getFiles,
+        getUserKey: db.getUserKey,
+        getMessages: db.getMessages,
+        updateFilesUsage: db.updateFilesUsage,
+        getUserKeyValues: db.getUserKeyValues,
+        getUserCodeFiles: db.getUserCodeFiles,
+        getToolFilesByIds: db.getToolFilesByIds,
+        getCodeGeneratedFiles: db.getCodeGeneratedFiles,
+      },
+    );
+
+    if (userMCPAuthMap != null) {
+      Object.assign(userMCPAuthMap, config.userMCPAuthMap ?? {});
+    } else {
+      userMCPAuthMap = config.userMCPAuthMap;
+    }
+
+    /** Store handoff agent's tool context for ON_TOOL_EXECUTE callback */
+    agentToolContexts.set(agentId, {
+      agent,
+      toolRegistry: config.toolRegistry,
+      userMCPAuthMap: config.userMCPAuthMap,
+      tool_resources: config.tool_resources,
+    });
+
+    agentConfigs.set(agentId, config);
+    return agent;
+  }
+
+  const checkAgentInit = (agentId) => agentId === primaryConfig.id || agentConfigs.has(agentId);
+
+  // Graph topology discovery for recursive agent handoffs (BFS)
+  const { edgeMap, agentsToProcess, collectEdges } = createEdgeCollector(
+    checkAgentInit,
+    skippedAgentIds,
+  );
+
+  // Seed with primary agent's edges
+  collectEdges(primaryConfig.edges);
+
+  // BFS to load and merge all connected agents (enables transitive handoffs: A->B->C)
+  while (agentsToProcess.size > 0) {
+    const agentId = agentsToProcess.values().next().value;
+    agentsToProcess.delete(agentId);
+    try {
+      const agent = await processAgent(agentId);
+      if (agent?.edges?.length) {
+        collectEdges(agent.edges);
+      }
+    } catch (err) {
+      logger.error(`[initializeClient] Error processing agent ${agentId}:`, err);
+      skippedAgentIds.add(agentId);
+    }
+  }
+
+  /** @deprecated Agent Chain */
+  if (agent_ids?.length) {
+    for (const agentId of agent_ids) {
+      if (checkAgentInit(agentId)) {
+        continue;
+      }
+      try {
+        await processAgent(agentId);
+      } catch (err) {
+        logger.error(`[initializeClient] Error processing chain agent ${agentId}:`, err);
+        skippedAgentIds.add(agentId);
+      }
+    }
+    const chain = await createSequentialChainEdges([primaryConfig.id].concat(agent_ids), '{convo}');
+    collectEdges(chain);
+  }
+
+  let edges = Array.from(edgeMap.values());
+
+  /** Multi-Convo: Process addedConvo for parallel agent execution */
+  const { userMCPAuthMap: updatedMCPAuthMap } = await processAddedConvo({
+    req,
+    res,
+    loadTools,
+    logViolation,
+    modelsConfig,
+    requestFiles,
+    agentConfigs,
+    primaryAgent,
+    endpointOption,
+    userMCPAuthMap,
+    conversationId,
+    parentMessageId,
+    allowedProviders,
+    primaryAgentId: primaryConfig.id,
+  });
+
+  if (updatedMCPAuthMap) {
+    userMCPAuthMap = updatedMCPAuthMap;
+  }
+
+  // Ensure edges is an array when we have multiple agents (multi-agent mode)
+  // MultiAgentGraph.categorizeEdges requires edges to be iterable
+  if (agentConfigs.size > 0 && !edges) {
+    edges = [];
+  }
+
+  // Filter out edges referencing non-existent agents (orphaned references)
+  edges = filterOrphanedEdges(edges, skippedAgentIds);
+
+  primaryConfig.edges = edges;
+
+  let endpointConfig = appConfig.endpoints?.[primaryConfig.endpoint];
+  if (!isAgentsEndpoint(primaryConfig.endpoint) && !endpointConfig) {
+    try {
+      endpointConfig = getCustomEndpointConfig({
+        endpoint: primaryConfig.endpoint,
+        appConfig,
       });
-      agentConfigs.set(agentId, config);
+    } catch (err) {
+      logger.error(
+        '[api/server/controllers/agents/client.js #titleConvo] Error getting custom endpoint config',
+        err,
+      );
     }
   }
 
@@ -356,6 +382,8 @@ const initializeClient = async ({ req, res, endpointOption }) => {
     getResponseSender({
       ...endpointOption,
       model: endpointOption.model_parameters.model,
+      modelDisplayLabel: endpointConfig?.modelDisplayLabel,
+      modelLabel: endpointOption.model_parameters.modelLabel,
     });
 
   const client = new AgentClient({
@@ -373,15 +401,16 @@ const initializeClient = async ({ req, res, endpointOption }) => {
     iconURL: endpointOption.iconURL,
     attachments: primaryConfig.attachments,
     endpointType: endpointOption.endpointType,
+    resendFiles: primaryConfig.resendFiles ?? true,
     maxContextTokens: primaryConfig.maxContextTokens,
-    resendFiles: primaryConfig.model_parameters?.resendFiles ?? true,
-    endpoint:
-      primaryConfig.id === Constants.EPHEMERAL_AGENT_ID
-        ? primaryConfig.endpoint
-        : EModelEndpoint.agents,
+    endpoint: isEphemeralAgentId(primaryConfig.id) ? primaryConfig.endpoint : EModelEndpoint.agents,
   });
 
-  return { client };
+  if (streamId) {
+    GenerationJobManager.setCollectedUsage(streamId, collectedUsage);
+  }
+
+  return { client, userMCPAuthMap };
 };
 
 module.exports = { initializeClient };

@@ -21,12 +21,14 @@ export enum QueryKeys {
   assistant = 'assistant',
   agents = 'agents',
   agent = 'agent',
-  endpointsConfigOverride = 'endpointsConfigOverride',
   files = 'files',
   fileConfig = 'fileConfig',
   tools = 'tools',
   toolAuth = 'toolAuth',
   toolCalls = 'toolCalls',
+  mcpTools = 'mcpTools',
+  mcpConnectionStatus = 'mcpConnectionStatus',
+  mcpAuthValues = 'mcpAuthValues',
   agentTools = 'agentTools',
   actions = 'actions',
   assistantDocs = 'assistantDocs',
@@ -41,14 +43,37 @@ export enum QueryKeys {
   promptGroup = 'promptGroup',
   categories = 'categories',
   randomPrompts = 'randomPrompts',
+  agentCategories = 'agentCategories',
+  marketplaceAgents = 'marketplaceAgents',
   roles = 'roles',
   conversationTags = 'conversationTags',
   health = 'health',
   userTerms = 'userTerms',
   banner = 'banner',
+  /* Memories */
+  memories = 'memories',
+  principalSearch = 'principalSearch',
+  accessRoles = 'accessRoles',
+  resourcePermissions = 'resourcePermissions',
+  effectivePermissions = 'effectivePermissions',
+  graphToken = 'graphToken',
+  /* MCP Servers */
+  mcpServers = 'mcpServers',
+  mcpServer = 'mcpServer',
+  /* Active Jobs */
+  activeJobs = 'activeJobs',
+  /* Agent API Keys */
+  agentApiKeys = 'agentApiKeys',
 }
 
+// Dynamic query keys that require parameters
+export const DynamicQueryKeys = {
+  agentFiles: (agentId: string) => ['agentFiles', agentId] as const,
+} as const;
+
 export enum MutationKeys {
+  createAgentApiKey = 'createAgentApiKey',
+  deleteAgentApiKey = 'deleteAgentApiKey',
   fileUpload = 'fileUpload',
   fileDelete = 'fileDelete',
   updatePreset = 'updatePreset',
@@ -70,4 +95,5 @@ export enum MutationKeys {
   updateRole = 'updateRole',
   enableTwoFactor = 'enableTwoFactor',
   verifyTwoFactor = 'verifyTwoFactor',
+  updateMemoryPreferences = 'updateMemoryPreferences',
 }

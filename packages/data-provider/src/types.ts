@@ -1,80 +1,148 @@
-import type OpenAI from 'openai';
 import type { InfiniteData } from '@tanstack/react-query';
 import type {
-  TMessage,
-  TResPlugin,
-  ImageDetail,
-  TSharedLink,
-  TConversation,
-  EModelEndpoint,
   TConversationTag,
+  EModelEndpoint,
+  TConversation,
+  TSharedLink,
+  TAttachment,
+  TMessage,
   TBanner,
 } from './schemas';
-import { TMinimalFeedback } from './feedback';
-import { SettingDefinition } from './generate';
-
-export type TOpenAIMessage = OpenAI.Chat.ChatCompletionMessageParam;
+import type { SettingDefinition } from './generate';
+import type { TMinimalFeedback } from './feedback';
+import type { ContentTypes } from './types/runs';
+import type { Agent } from './types/assistants';
 
 export * from './schemas';
 
 export type TMessages = TMessage[];
 
 /* TODO: Cleanup EndpointOption types */
-export type TEndpointOption = {
-  spec?: string | null;
-  iconURL?: string | null;
-  endpoint: EModelEndpoint;
-  endpointType?: EModelEndpoint;
+export type TEndpointOption = Pick<
+  TConversation,
+  // Core conversation fields
+  | 'endpoint'
+  | 'endpointType'
+  | 'model'
+  | 'modelLabel'
+  | 'chatGptLabel'
+  | 'promptPrefix'
+  | 'temperature'
+  | 'topP'
+  | 'topK'
+  | 'top_p'
+  | 'frequency_penalty'
+  | 'presence_penalty'
+  | 'maxOutputTokens'
+  | 'maxContextTokens'
+  | 'max_tokens'
+  | 'maxTokens'
+  | 'resendFiles'
+  | 'imageDetail'
+  | 'reasoning_effort'
+  | 'verbosity'
+  | 'instructions'
+  | 'additional_instructions'
+  | 'append_current_datetime'
+  | 'tools'
+  | 'stop'
+  | 'region'
+  | 'additionalModelRequestFields'
+  // Anthropic-specific
+  | 'promptCache'
+  | 'thinking'
+  | 'thinkingBudget'
+  | 'thinkingLevel'
+  | 'effort'
+  // Assistant/Agent fields
+  | 'assistant_id'
+  | 'agent_id'
+  // UI/Display fields
+  | 'iconURL'
+  | 'greeting'
+  | 'spec'
+  // Artifacts
+  | 'artifacts'
+  // Files
+  | 'file_ids'
+  // System field
+  | 'system'
+  // Google examples
+  | 'examples'
+  // Context
+  | 'context'
+> & {
+  // Fields specific to endpoint options that don't exist on TConversation
   modelDisplayLabel?: string;
-  resendFiles?: boolean;
-  promptCache?: boolean;
-  maxContextTokens?: number;
-  imageDetail?: ImageDetail;
-  model?: string | null;
-  promptPrefix?: string;
-  temperature?: number;
-  chatGptLabel?: string | null;
-  modelLabel?: string | null;
-  jailbreak?: boolean;
   key?: string | null;
-  /* assistant */
+  /** @deprecated Assistants API */
   thread_id?: string;
-  /* multi-response stream */
+  // Conversation identifiers for multi-response streams
   overrideConvoId?: string;
   overrideUserMessageId?: string;
+  // Model parameters (used by different endpoints)
+  modelOptions?: Record<string, unknown>;
+  model_parameters?: Record<string, unknown>;
+  // Configuration data (added by middleware)
+  modelsConfig?: TModelsConfig;
+  // File attachments (processed by middleware)
+  attachments?: TAttachment[];
+  // Generated prompts
+  artifactsPrompt?: string;
+  // Agent-specific fields
+  agent?: Promise<Agent>;
+  // Client-specific options
+  clientOptions?: Record<string, unknown>;
 };
 
 export type TEphemeralAgent = {
   mcp?: string[];
   web_search?: boolean;
+  file_search?: boolean;
   execute_code?: boolean;
+  artifacts?: string;
 };
 
 export type TPayload = Partial<TMessage> &
   Partial<TEndpointOption> & {
     isContinued: boolean;
+    isRegenerate?: boolean;
     conversationId: string | null;
     messages?: TMessages;
     isTemporary: boolean;
     ephemeralAgent?: TEphemeralAgent | null;
+    editedContent?: TEditedContent | null;
+    /** Added conversation for multi-convo feature */
+    addedConvo?: TConversation;
   };
 
+export type TEditedContent =
+  | {
+      index: number;
+      type: ContentTypes.THINK;
+      [ContentTypes.THINK]: string;
+    }
+  | {
+      index: number;
+      type: ContentTypes.TEXT;
+      [ContentTypes.TEXT]: string;
+    };
+
 export type TSubmission = {
-  artifacts?: string;
-  plugin?: TResPlugin;
-  plugins?: TResPlugin[];
   userMessage: TMessage;
   isEdited?: boolean;
   isContinued?: boolean;
   isTemporary: boolean;
   messages: TMessage[];
   isRegenerate?: boolean;
-  isResubmission?: boolean;
   initialResponse?: TMessage;
   conversation: Partial<TConversation>;
   endpointOption: TEndpointOption;
   clientTimestamp?: string;
   ephemeralAgent?: TEphemeralAgent | null;
+  editedContent?: TEditedContent | null;
+  /** Added conversation for multi-convo feature */
+  addedConvo?: TConversation;
 };
 
 export type EventSubmission = Omit<TSubmission, 'initialResponse'> & { initialResponse: TMessage };
@@ -82,7 +150,7 @@ export type EventSubmission = Omit<TSubmission, 'initialResponse'> & { initialRe
 export type TPluginAction = {
   pluginKey: string;
   action: 'install' | 'uninstall';
-  auth?: Partial<Record<string, string>>;
+  auth?: Partial<Record<string, string>> | null;
   isEntityTool?: boolean;
 };
 
@@ -92,7 +160,7 @@ export type TUpdateUserPlugins = {
   isEntityTool?: boolean;
   pluginKey: string;
   action: string;
-  auth?: Partial<Record<string, string | null>>;
+  auth?: Partial<Record<string, string | null>> | null;
 };
 
 // TODO `label` needs to be changed to the proper `TranslationKeys`
@@ -100,6 +168,12 @@ export type TCategory = {
   id?: string;
   value: string;
   label: string;
+  description?: string;
+  custom?: boolean;
+};
+
+export type TMarketplaceCategory = TCategory & {
+  count: number;
 };
 
 export type TError = {
@@ -130,6 +204,9 @@ export type TUser = {
   plugins?: string[];
   twoFactorEnabled?: boolean;
   backupCodes?: TBackupCode[];
+  personalization?: {
+    memories?: boolean;
+  };
   createdAt: string;
   updatedAt: string;
 };
@@ -159,6 +236,33 @@ export type TUpdateUserKeyRequest = {
   name: string;
   value: string;
   expiresAt: string;
+};
+
+export type TAgentApiKeyCreateRequest = {
+  name: string;
+  expiresAt?: string | null;
+};
+
+export type TAgentApiKeyCreateResponse = {
+  id: string;
+  name: string;
+  key: string;
+  keyPrefix: string;
+  createdAt: string;
+  expiresAt?: string;
+};
+
+export type TAgentApiKeyListItem = {
+  id: string;
+  name: string;
+  keyPrefix: string;
+  lastUsedAt?: string;
+  expiresAt?: string;
+  createdAt: string;
+};
+
+export type TAgentApiKeyListResponse = {
+  keys: TAgentApiKeyListItem[];
 };
 
 export type TUpdateConversationRequest = {
@@ -274,7 +378,7 @@ export type TConfig = {
   capabilities?: string[];
   customParams?: {
     defaultParamsEndpoint?: string;
-    paramDefinitions?: SettingDefinition[];
+    paramDefinitions?: Partial<SettingDefinition>[];
   };
 };
 
@@ -349,6 +453,14 @@ export type TVerify2FATempResponse = {
   token?: string;
   user?: TUser;
   message?: string;
+};
+
+/**
+ * Request for disabling 2FA.
+ */
+export type TDisable2FARequest = {
+  token?: string;
+  backupCode?: string;
 };
 
 /**
@@ -455,8 +567,10 @@ export type TPromptsWithFilterRequest = {
 
 export type TPromptGroupsWithFilterRequest = {
   category: string;
-  pageNumber: string;
-  pageSize: string | number;
+  pageNumber?: string; // Made optional for cursor-based pagination
+  pageSize?: string | number;
+  limit?: string | number; // For cursor-based pagination
+  cursor?: string; // For cursor-based pagination
   before?: string | null;
   after?: string | null;
   order?: 'asc' | 'desc';
@@ -469,6 +583,8 @@ export type PromptGroupListResponse = {
   pageNumber: string;
   pageSize: string | number;
   pages: string | number;
+  has_more: boolean; // Added for cursor-based pagination
+  after: string | null; // Added for cursor-based pagination
 };
 
 export type PromptGroupListData = InfiniteData<PromptGroupListResponse>;
@@ -557,7 +673,7 @@ export type TUpdateFeedbackResponse = {
   messageId: string;
   conversationId: string;
   feedback?: TMinimalFeedback;
-}
+};
 
 export type TBalanceResponse = {
   tokenCredits: number;

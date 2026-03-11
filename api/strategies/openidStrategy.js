@@ -1,38 +1,140 @@
+const undici = require('undici');
+const { get } = require('lodash');
 const fetch = require('node-fetch');
 const passport = require('passport');
 const client = require('openid-client');
 const jwtDecode = require('jsonwebtoken/decode');
-const { CacheKeys } = require('librechat-data-provider');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { hashToken, logger } = require('@librechat/data-schemas');
 const { Strategy: OpenIDStrategy } = require('openid-client/passport');
+const { CacheKeys, ErrorTypes, SystemRoles } = require('librechat-data-provider');
+const {
+  isEnabled,
+  logHeaders,
+  safeStringify,
+  findOpenIDUser,
+  getBalanceConfig,
+  isEmailDomainAllowed,
+} = require('@librechat/api');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { findUser, createUser, updateUser } = require('~/models');
-const { getBalanceConfig } = require('~/server/services/Config');
+const { getAppConfig } = require('~/server/services/Config');
 const getLogStores = require('~/cache/getLogStores');
-const { isEnabled } = require('~/server/utils');
 
 /**
  * @typedef {import('openid-client').ClientMetadata} ClientMetadata
  * @typedef {import('openid-client').Configuration} Configuration
  **/
 
+/**
+ * @param {string} url
+ * @param {client.CustomFetchOptions} options
+ */
+async function customFetch(url, options) {
+  const urlStr = url.toString();
+  logger.debug(`[openidStrategy] Request to: ${urlStr}`);
+  const debugOpenId = isEnabled(process.env.DEBUG_OPENID_REQUESTS);
+  if (debugOpenId) {
+    logger.debug(`[openidStrategy] Request method: ${options.method || 'GET'}`);
+    logger.debug(`[openidStrategy] Request headers: ${logHeaders(options.headers)}`);
+    if (options.body) {
+      let bodyForLogging = '';
+      if (options.body instanceof URLSearchParams) {
+        bodyForLogging = options.body.toString();
+      } else if (typeof options.body === 'string') {
+        bodyForLogging = options.body;
+      } else {
+        bodyForLogging = safeStringify(options.body);
+      }
+      logger.debug(`[openidStrategy] Request body: ${bodyForLogging}`);
+    }
+  }
+
+  try {
+    /** @type {undici.RequestInit} */
+    let fetchOptions = options;
+    if (process.env.PROXY) {
+      logger.info(`[openidStrategy] proxy agent configured: ${process.env.PROXY}`);
+      fetchOptions = {
+        ...options,
+        dispatcher: new undici.ProxyAgent(process.env.PROXY),
+      };
+    }
+
+    const response = await undici.fetch(url, fetchOptions);
+
+    if (debugOpenId) {
+      logger.debug(`[openidStrategy] Response status: ${response.status} ${response.statusText}`);
+      logger.debug(`[openidStrategy] Response headers: ${logHeaders(response.headers)}`);
+    }
+
+    if (response.status === 200 && response.headers.has('www-authenticate')) {
+      const wwwAuth = response.headers.get('www-authenticate');
+      logger.warn(`[openidStrategy] Non-standard WWW-Authenticate header found in successful response (200 OK): ${wwwAuth}.
+This violates RFC 7235 and may cause issues with strict OAuth clients. Removing header for compatibility.`);
+
+      /** Cloned response without the WWW-Authenticate header */
+      const responseBody = await response.arrayBuffer();
+      const newHeaders = new Headers();
+      for (const [key, value] of response.headers.entries()) {
+        if (key.toLowerCase() !== 'www-authenticate') {
+          newHeaders.append(key, value);
+        }
+      }
+
+      return new Response(responseBody, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: newHeaders,
+      });
+    }
+
+    return response;
+  } catch (error) {
+    logger.error(`[openidStrategy] Fetch error: ${error.message}`);
+    throw error;
+  }
+}
+
 /** @typedef {Configuration | null}  */
 let openidConfig = null;
 
-//overload currenturl function because of express version 4 buggy req.host doesn't include port
-//More info https://github.com/panva/openid-client/pull/713
-
+/**
+ * Custom OpenID Strategy
+ *
+ * Note: Originally overrode currentUrl() to work around Express 4's req.host not including port.
+ * With Express 5, req.host now includes the port by default, but we continue to use DOMAIN_SERVER
+ * for consistency and explicit configuration control.
+ * More info: https://github.com/panva/openid-client/pull/713
+ */
 class CustomOpenIDStrategy extends OpenIDStrategy {
   currentUrl(req) {
     const hostAndProtocol = process.env.DOMAIN_SERVER;
     return new URL(`${hostAndProtocol}${req.originalUrl ?? req.url}`);
   }
+
   authorizationRequestParams(req, options) {
     const params = super.authorizationRequestParams(req, options);
     if (options?.state && !params.has('state')) {
       params.set('state', options.state);
     }
+
+    if (process.env.OPENID_AUDIENCE) {
+      params.set('audience', process.env.OPENID_AUDIENCE);
+      logger.debug(
+        `[openidStrategy] Adding audience to authorization request: ${process.env.OPENID_AUDIENCE}`,
+      );
+    }
+
+    /** Generate nonce for federated providers that require it */
+    const shouldGenerateNonce = isEnabled(process.env.OPENID_GENERATE_NONCE);
+    if (shouldGenerateNonce && !params.has('nonce') && this._sessionKey) {
+      const crypto = require('crypto');
+      const nonce = crypto.randomBytes(16).toString('hex');
+      params.set('nonce', nonce);
+      logger.debug('[openidStrategy] Generated nonce for federated provider:', nonce);
+    }
+
     return params;
   }
 }
@@ -47,7 +149,7 @@ class CustomOpenIDStrategy extends OpenIDStrategy {
  */
 const exchangeAccessTokenIfNeeded = async (config, accessToken, sub, fromCache = false) => {
   const tokensCache = getLogStores(CacheKeys.OPENID_EXCHANGED_TOKENS);
-  const onBehalfFlowRequired = isEnabled(process.env.OPENID_ON_BEHALF_FLOW_FOR_USERINFRO_REQUIRED);
+  const onBehalfFlowRequired = isEnabled(process.env.OPENID_ON_BEHALF_FLOW_FOR_USERINFO_REQUIRED);
   if (onBehalfFlowRequired) {
     if (fromCache) {
       const cachedToken = await tokensCache.get(sub);
@@ -59,7 +161,7 @@ const exchangeAccessTokenIfNeeded = async (config, accessToken, sub, fromCache =
       config,
       'urn:ietf:params:oauth:grant-type:jwt-bearer',
       {
-        scope: process.env.OPENID_ON_BEHALF_FLOW_USERINFRO_SCOPE || 'user.read',
+        scope: process.env.OPENID_ON_BEHALF_FLOW_USERINFO_SCOPE || 'user.read',
         assertion: accessToken,
         requested_token_use: 'on_behalf_of',
       },
@@ -88,7 +190,7 @@ const getUserInfo = async (config, accessToken, sub) => {
     const exchangedAccessToken = await exchangeAccessTokenIfNeeded(config, accessToken, sub);
     return await client.fetchUserInfo(config, exchangedAccessToken, sub);
   } catch (error) {
-    logger.warn(`[openidStrategy] getUserInfo: Error fetching user info: ${error}`);
+    logger.error('[openidStrategy] getUserInfo: Error fetching user info:', error);
     return null;
   }
 };
@@ -166,6 +268,34 @@ function getFullName(userinfo) {
 }
 
 /**
+ * Resolves the user identifier from OpenID claims.
+ * Configurable via OPENID_EMAIL_CLAIM; defaults to: email -> preferred_username -> upn.
+ *
+ * @param {Object} userinfo - The user information object from OpenID Connect
+ * @returns {string|undefined} The resolved identifier string
+ */
+function getOpenIdEmail(userinfo) {
+  const claimKey = process.env.OPENID_EMAIL_CLAIM?.trim();
+  if (claimKey) {
+    const value = userinfo[claimKey];
+    if (typeof value === 'string' && value) {
+      return value;
+    }
+    if (value !== undefined && value !== null) {
+      logger.warn(
+        `[openidStrategy] OPENID_EMAIL_CLAIM="${claimKey}" resolved to a non-string value (type: ${typeof value}). Falling back to: email -> preferred_username -> upn.`,
+      );
+    } else {
+      logger.warn(
+        `[openidStrategy] OPENID_EMAIL_CLAIM="${claimKey}" not present in userinfo. Falling back to: email -> preferred_username -> upn.`,
+      );
+    }
+  }
+  const fallback = userinfo.email || userinfo.preferred_username || userinfo.upn;
+  return typeof fallback === 'string' ? fallback : undefined;
+}
+
+/**
  * Converts an input into a string suitable for a username.
  * If the input is a string, it will be returned as is.
  * If the input is an array, elements will be joined with underscores.
@@ -186,6 +316,367 @@ function convertToUsername(input, defaultValue = '') {
 }
 
 /**
+ * Resolve Azure AD groups when group overage is in effect (groups moved to _claim_names/_claim_sources).
+ *
+ * NOTE: Microsoft recommends treating _claim_names/_claim_sources as a signal only and using Microsoft Graph
+ * to resolve group membership instead of calling the endpoint in _claim_sources directly.
+ *
+ * @param {string} accessToken - Access token with Microsoft Graph permissions
+ * @returns {Promise<string[] | null>} Resolved group IDs or null on failure
+ * @see https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference#groups-overage-claim
+ * @see https://learn.microsoft.com/en-us/graph/api/directoryobject-getmemberobjects
+ */
+async function resolveGroupsFromOverage(accessToken) {
+  try {
+    if (!accessToken) {
+      logger.error('[openidStrategy] Access token missing; cannot resolve group overage');
+      return null;
+    }
+
+    // Use /me/getMemberObjects so least-privileged delegated permission User.Read is sufficient
+    // when resolving the signed-in user's group membership.
+    const url = 'https://graph.microsoft.com/v1.0/me/getMemberObjects';
+
+    logger.debug(
+      `[openidStrategy] Detected group overage, resolving groups via Microsoft Graph getMemberObjects: ${url}`,
+    );
+
+    const fetchOptions = {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ securityEnabledOnly: false }),
+    };
+
+    if (process.env.PROXY) {
+      const { ProxyAgent } = undici;
+      fetchOptions.dispatcher = new ProxyAgent(process.env.PROXY);
+    }
+
+    const response = await undici.fetch(url, fetchOptions);
+    if (!response.ok) {
+      logger.error(
+        `[openidStrategy] Failed to resolve groups via Microsoft Graph getMemberObjects: HTTP ${response.status} ${response.statusText}`,
+      );
+      return null;
+    }
+
+    const data = await response.json();
+    const values = Array.isArray(data?.value) ? data.value : null;
+    if (!values) {
+      logger.error(
+        '[openidStrategy] Unexpected response format when resolving groups via Microsoft Graph getMemberObjects',
+      );
+      return null;
+    }
+    const groupIds = values.filter((id) => typeof id === 'string');
+
+    logger.debug(
+      `[openidStrategy] Successfully resolved ${groupIds.length} groups via Microsoft Graph getMemberObjects`,
+    );
+    return groupIds;
+  } catch (err) {
+    logger.error(
+      '[openidStrategy] Error resolving groups via Microsoft Graph getMemberObjects:',
+      err,
+    );
+    return null;
+  }
+}
+
+/**
+ * Process OpenID authentication tokenset and userinfo
+ * This is the core logic extracted from the passport strategy callback
+ * Can be reused by both the passport strategy and proxy authentication
+ *
+ * @param {Object} tokenset - The OpenID tokenset containing access_token, id_token, etc.
+ * @param {boolean} existingUsersOnly - If true, only existing users will be processed
+ * @returns {Promise<Object>} The authenticated user object with tokenset
+ */
+async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
+  const claims = tokenset.claims ? tokenset.claims() : tokenset;
+  const userinfo = {
+    ...claims,
+  };
+
+  if (tokenset.access_token) {
+    const providerUserinfo = await getUserInfo(openidConfig, tokenset.access_token, claims.sub);
+    Object.assign(userinfo, providerUserinfo);
+  }
+
+  const appConfig = await getAppConfig();
+  const email = getOpenIdEmail(userinfo);
+  if (!isEmailDomainAllowed(email, appConfig?.registration?.allowedDomains)) {
+    logger.error(
+      `[OpenID Strategy] Authentication blocked - email domain not allowed [Identifier: ${email}]`,
+    );
+    throw new Error('Email domain not allowed');
+  }
+
+  const result = await findOpenIDUser({
+    findUser,
+    email: email,
+    openidId: claims.sub || userinfo.sub,
+    idOnTheSource: claims.oid || userinfo.oid,
+    strategyName: 'openidStrategy',
+  });
+  let user = result.user;
+  const error = result.error;
+
+  if (error) {
+    throw new Error(ErrorTypes.AUTH_FAILED);
+  }
+
+  const fullName = getFullName(userinfo);
+
+  const requiredRole = process.env.OPENID_REQUIRED_ROLE;
+  if (requiredRole) {
+    const requiredRoles = requiredRole
+      .split(',')
+      .map((role) => role.trim())
+      .filter(Boolean);
+    const requiredRoleParameterPath = process.env.OPENID_REQUIRED_ROLE_PARAMETER_PATH;
+    const requiredRoleTokenKind = process.env.OPENID_REQUIRED_ROLE_TOKEN_KIND;
+
+    let decodedToken = '';
+    if (requiredRoleTokenKind === 'access' && tokenset.access_token) {
+      decodedToken = jwtDecode(tokenset.access_token);
+    } else if (requiredRoleTokenKind === 'id' && tokenset.id_token) {
+      decodedToken = jwtDecode(tokenset.id_token);
+    }
+
+    let roles = get(decodedToken, requiredRoleParameterPath);
+
+    // Handle Azure AD group overage for ID token groups: when hasgroups or _claim_* indicate overage,
+    // resolve groups via Microsoft Graph instead of relying on token group values.
+    if (
+      !Array.isArray(roles) &&
+      typeof roles !== 'string' &&
+      requiredRoleTokenKind === 'id' &&
+      requiredRoleParameterPath === 'groups' &&
+      decodedToken &&
+      (decodedToken.hasgroups ||
+        (decodedToken._claim_names?.groups &&
+          decodedToken._claim_sources?.[decodedToken._claim_names.groups]))
+    ) {
+      const overageGroups = await resolveGroupsFromOverage(tokenset.access_token);
+      if (overageGroups) {
+        roles = overageGroups;
+      }
+    }
+
+    if (!roles || (!Array.isArray(roles) && typeof roles !== 'string')) {
+      logger.error(
+        `[openidStrategy] Key '${requiredRoleParameterPath}' not found in ${requiredRoleTokenKind} token!`,
+      );
+      const rolesList =
+        requiredRoles.length === 1
+          ? `"${requiredRoles[0]}"`
+          : `one of: ${requiredRoles.map((r) => `"${r}"`).join(', ')}`;
+      throw new Error(`You must have ${rolesList} role to log in.`);
+    }
+
+    const roleValues = Array.isArray(roles) ? roles : roles.split(/[\s,]+/).filter(Boolean);
+
+    if (!requiredRoles.some((role) => roleValues.includes(role))) {
+      const rolesList =
+        requiredRoles.length === 1
+          ? `"${requiredRoles[0]}"`
+          : `one of: ${requiredRoles.map((r) => `"${r}"`).join(', ')}`;
+      throw new Error(`You must have ${rolesList} role to log in.`);
+    }
+  }
+
+  let username = '';
+  if (process.env.OPENID_USERNAME_CLAIM) {
+    username = userinfo[process.env.OPENID_USERNAME_CLAIM];
+  } else {
+    username = convertToUsername(
+      userinfo.preferred_username || userinfo.username || userinfo.email,
+    );
+  }
+
+  if (existingUsersOnly && !user) {
+    throw new Error('User does not exist');
+  }
+
+  if (!user) {
+    user = {
+      provider: 'openid',
+      openidId: userinfo.sub,
+      username,
+      email: email || '',
+      emailVerified: userinfo.email_verified || false,
+      name: fullName,
+      idOnTheSource: userinfo.oid,
+    };
+
+    const balanceConfig = getBalanceConfig(appConfig);
+    user = await createUser(user, balanceConfig, true, true);
+  } else {
+    user.provider = 'openid';
+    user.openidId = userinfo.sub;
+    user.username = username;
+    user.name = fullName;
+    user.idOnTheSource = userinfo.oid;
+    if (email && email !== user.email) {
+      user.email = email;
+      user.emailVerified = userinfo.email_verified || false;
+    }
+  }
+
+  const adminRole = process.env.OPENID_ADMIN_ROLE;
+  const adminRoleParameterPath = process.env.OPENID_ADMIN_ROLE_PARAMETER_PATH;
+  const adminRoleTokenKind = process.env.OPENID_ADMIN_ROLE_TOKEN_KIND;
+
+  if (adminRole && adminRoleParameterPath && adminRoleTokenKind) {
+    let adminRoleObject;
+    switch (adminRoleTokenKind) {
+      case 'access':
+        adminRoleObject = jwtDecode(tokenset.access_token);
+        break;
+      case 'id':
+        adminRoleObject = jwtDecode(tokenset.id_token);
+        break;
+      case 'userinfo':
+        adminRoleObject = userinfo;
+        break;
+      default:
+        logger.error(
+          `[openidStrategy] Invalid admin role token kind: ${adminRoleTokenKind}. Must be one of 'access', 'id', or 'userinfo'.`,
+        );
+        throw new Error('Invalid admin role token kind');
+    }
+
+    const adminRoles = get(adminRoleObject, adminRoleParameterPath);
+    let adminRoleValues = [];
+    if (Array.isArray(adminRoles)) {
+      adminRoleValues = adminRoles;
+    } else if (typeof adminRoles === 'string') {
+      adminRoleValues = adminRoles.split(/[\s,]+/).filter(Boolean);
+    }
+
+    if (adminRoles && (adminRoles === true || adminRoleValues.includes(adminRole))) {
+      user.role = SystemRoles.ADMIN;
+      logger.info(`[openidStrategy] User ${username} is an admin based on role: ${adminRole}`);
+    } else if (user.role === SystemRoles.ADMIN) {
+      user.role = SystemRoles.USER;
+      logger.info(
+        `[openidStrategy] User ${username} demoted from admin - role no longer present in token`,
+      );
+    }
+  }
+
+  if (!!userinfo && userinfo.picture && !user.avatar?.includes('manual=true')) {
+    /** @type {string | undefined} */
+    const imageUrl = userinfo.picture;
+
+    let fileName;
+    if (crypto) {
+      fileName = (await hashToken(userinfo.sub)) + '.png';
+    } else {
+      fileName = userinfo.sub + '.png';
+    }
+
+    const imageBuffer = await downloadImage(
+      imageUrl,
+      openidConfig,
+      tokenset.access_token,
+      userinfo.sub,
+    );
+    if (imageBuffer) {
+      const { saveBuffer } = getStrategyFunctions(
+        appConfig?.fileStrategy ?? process.env.CDN_PROVIDER,
+      );
+      const imagePath = await saveBuffer({
+        fileName,
+        userId: user._id.toString(),
+        buffer: imageBuffer,
+      });
+      user.avatar = imagePath ?? '';
+    }
+  }
+
+  user = await updateUser(user._id, user);
+
+  logger.info(
+    `[openidStrategy] login success openidId: ${user.openidId} | email: ${user.email} | username: ${user.username} `,
+    {
+      user: {
+        openidId: user.openidId,
+        username: user.username,
+        email: user.email,
+        name: user.name,
+      },
+    },
+  );
+
+  return {
+    ...user,
+    tokenset,
+    federatedTokens: {
+      access_token: tokenset.access_token,
+      id_token: tokenset.id_token,
+      refresh_token: tokenset.refresh_token,
+      expires_at: tokenset.expires_at,
+    },
+  };
+}
+
+/**
+ * @param {boolean | undefined} [existingUsersOnly]
+ */
+function createOpenIDCallback(existingUsersOnly) {
+  return async (tokenset, done) => {
+    try {
+      const user = await processOpenIDAuth(tokenset, existingUsersOnly);
+      done(null, user);
+    } catch (err) {
+      if (err.message === 'Email domain not allowed') {
+        return done(null, false, { message: err.message });
+      }
+      if (err.message === ErrorTypes.AUTH_FAILED) {
+        return done(null, false, { message: err.message });
+      }
+      if (err.message && err.message.includes('role to log in')) {
+        return done(null, false, { message: err.message });
+      }
+      logger.error('[openidStrategy] login failed', err);
+      done(err);
+    }
+  };
+}
+
+/**
+ * Sets up the OpenID strategy specifically for admin authentication.
+ * @param {Configuration} openidConfig
+ */
+const setupOpenIdAdmin = (openidConfig) => {
+  try {
+    if (!openidConfig) {
+      throw new Error('OpenID configuration not initialized');
+    }
+
+    const openidAdminLogin = new CustomOpenIDStrategy(
+      {
+        config: openidConfig,
+        scope: process.env.OPENID_SCOPE,
+        usePKCE: isEnabled(process.env.OPENID_USE_PKCE),
+        clockTolerance: process.env.OPENID_CLOCK_TOLERANCE || 300,
+        callbackURL: process.env.DOMAIN_SERVER + '/api/admin/oauth/openid/callback',
+      },
+      createOpenIDCallback(true),
+    );
+
+    passport.use('openidAdmin', openidAdminLogin);
+  } catch (err) {
+    logger.error('[openidStrategy] setupOpenIdAdmin', err);
+  }
+};
+
+/**
  * Sets up the OpenID strategy for authentication.
  * This function configures the OpenID client, handles proxy settings,
  * and defines the OpenID strategy for Passport.js.
@@ -197,173 +688,57 @@ function convertToUsername(input, defaultValue = '') {
  */
 async function setupOpenId() {
   try {
+    const shouldGenerateNonce = isEnabled(process.env.OPENID_GENERATE_NONCE);
+
     /** @type {ClientMetadata} */
     const clientMetadata = {
       client_id: process.env.OPENID_CLIENT_ID,
       client_secret: process.env.OPENID_CLIENT_SECRET,
     };
 
+    if (shouldGenerateNonce) {
+      clientMetadata.response_types = ['code'];
+      clientMetadata.grant_types = ['authorization_code'];
+      clientMetadata.token_endpoint_auth_method = 'client_secret_post';
+    }
+
     /** @type {Configuration} */
     openidConfig = await client.discovery(
       new URL(process.env.OPENID_ISSUER),
       process.env.OPENID_CLIENT_ID,
       clientMetadata,
+      undefined,
+      {
+        [client.customFetch]: customFetch,
+      },
     );
-    if (process.env.PROXY) {
-      const proxyAgent = new HttpsProxyAgent(process.env.PROXY);
-      openidConfig[client.customFetch] = (...args) => {
-        return fetch(args[0], { ...args[1], agent: proxyAgent });
-      };
-      logger.info(`[openidStrategy] proxy agent added: ${process.env.PROXY}`);
-    }
-    const requiredRole = process.env.OPENID_REQUIRED_ROLE;
-    const requiredRoleParameterPath = process.env.OPENID_REQUIRED_ROLE_PARAMETER_PATH;
-    const requiredRoleTokenKind = process.env.OPENID_REQUIRED_ROLE_TOKEN_KIND;
-    const usePKCE = isEnabled(process.env.OPENID_USE_PKCE);
+
+    logger.info(`[openidStrategy] OpenID authentication configuration`, {
+      generateNonce: shouldGenerateNonce,
+      reason: shouldGenerateNonce
+        ? 'OPENID_GENERATE_NONCE=true - Will generate nonce and use explicit metadata for federated providers'
+        : 'OPENID_GENERATE_NONCE=false - Standard flow without explicit nonce or metadata',
+    });
+
     const openidLogin = new CustomOpenIDStrategy(
       {
         config: openidConfig,
         scope: process.env.OPENID_SCOPE,
         callbackURL: process.env.DOMAIN_SERVER + process.env.OPENID_CALLBACK_URL,
-        usePKCE,
+        clockTolerance: process.env.OPENID_CLOCK_TOLERANCE || 300,
+        usePKCE: isEnabled(process.env.OPENID_USE_PKCE),
       },
-      async (tokenset, done) => {
-        try {
-          const claims = tokenset.claims();
-          let user = await findUser({ openidId: claims.sub });
-          logger.info(
-            `[openidStrategy] user ${user ? 'found' : 'not found'} with openidId: ${claims.sub}`,
-          );
-
-          if (!user) {
-            user = await findUser({ email: claims.email });
-            logger.info(
-              `[openidStrategy] user ${user ? 'found' : 'not found'} with email: ${
-                claims.email
-              } for openidId: ${claims.sub}`,
-            );
-          }
-          const userinfo = {
-            ...claims,
-            ...(await getUserInfo(openidConfig, tokenset.access_token, claims.sub)),
-          };
-          const fullName = getFullName(userinfo);
-
-          if (requiredRole) {
-            let decodedToken = '';
-            if (requiredRoleTokenKind === 'access') {
-              decodedToken = jwtDecode(tokenset.access_token);
-            } else if (requiredRoleTokenKind === 'id') {
-              decodedToken = jwtDecode(tokenset.id_token);
-            }
-            const pathParts = requiredRoleParameterPath.split('.');
-            let found = true;
-            let roles = pathParts.reduce((o, key) => {
-              if (o === null || o === undefined || !(key in o)) {
-                found = false;
-                return [];
-              }
-              return o[key];
-            }, decodedToken);
-
-            if (!found) {
-              logger.error(
-                `[openidStrategy] Key '${requiredRoleParameterPath}' not found in ${requiredRoleTokenKind} token!`,
-              );
-            }
-
-            if (!roles.includes(requiredRole)) {
-              return done(null, false, {
-                message: `You must have the "${requiredRole}" role to log in.`,
-              });
-            }
-          }
-
-          let username = '';
-          if (process.env.OPENID_USERNAME_CLAIM) {
-            username = userinfo[process.env.OPENID_USERNAME_CLAIM];
-          } else {
-            username = convertToUsername(
-              userinfo.username || userinfo.given_name || userinfo.email,
-            );
-          }
-
-          if (!user) {
-            user = {
-              provider: 'openid',
-              openidId: userinfo.sub,
-              username,
-              email: userinfo.email || '',
-              emailVerified: userinfo.email_verified || false,
-              name: fullName,
-            };
-
-            const balanceConfig = await getBalanceConfig();
-
-            user = await createUser(user, balanceConfig, true, true);
-          } else {
-            user.provider = 'openid';
-            user.openidId = userinfo.sub;
-            user.username = username;
-            user.name = fullName;
-          }
-
-          if (!!userinfo && userinfo.picture && !user.avatar?.includes('manual=true')) {
-            /** @type {string | undefined} */
-            const imageUrl = userinfo.picture;
-
-            let fileName;
-            if (crypto) {
-              fileName = (await hashToken(userinfo.sub)) + '.png';
-            } else {
-              fileName = userinfo.sub + '.png';
-            }
-
-            const imageBuffer = await downloadImage(
-              imageUrl,
-              openidConfig,
-              tokenset.access_token,
-              userinfo.sub,
-            );
-            if (imageBuffer) {
-              const { saveBuffer } = getStrategyFunctions(process.env.CDN_PROVIDER);
-              const imagePath = await saveBuffer({
-                fileName,
-                userId: user._id.toString(),
-                buffer: imageBuffer,
-              });
-              user.avatar = imagePath ?? '';
-            }
-          }
-
-          user = await updateUser(user._id, user);
-
-          logger.info(
-            `[openidStrategy] login success openidId: ${user.openidId} | email: ${user.email} | username: ${user.username} `,
-            {
-              user: {
-                openidId: user.openidId,
-                username: user.username,
-                email: user.email,
-                name: user.name,
-              },
-            },
-          );
-
-          done(null, { ...user, tokenset });
-        } catch (err) {
-          logger.error('[openidStrategy] login failed', err);
-          done(err);
-        }
-      },
+      createOpenIDCallback(),
     );
     passport.use('openid', openidLogin);
+    setupOpenIdAdmin(openidConfig);
     return openidConfig;
   } catch (err) {
     logger.error('[openidStrategy]', err);
     return null;
   }
 }
+
 /**
  * @function getOpenIdConfig
  * @description Returns the OpenID client instance.
@@ -380,4 +755,5 @@ function getOpenIdConfig() {
 module.exports = {
   setupOpenId,
   getOpenIdConfig,
+  getOpenIdEmail,
 };

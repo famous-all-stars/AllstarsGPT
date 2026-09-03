@@ -13,11 +13,11 @@
 
 import { Keyv } from 'keyv';
 import { logger } from '@librechat/data-schemas';
-import { FlowStateManager, PENDING_STALE_MS } from '~/flow/manager';
-import { MCPTokenStorage, ReauthenticationRequiredError } from '~/mcp/oauth';
-import { MockKeyv, InMemoryTokenStore, createOAuthMCPServer } from './helpers/oauthTestServer';
 import type { OAuthTestServer } from './helpers/oauthTestServer';
 import type { MCPOAuthTokens } from '~/mcp/oauth';
+import { MockKeyv, InMemoryTokenStore, createOAuthMCPServer } from './helpers/oauthTestServer';
+import { MCPTokenStorage, ReauthenticationRequiredError } from '~/mcp/oauth';
+import { FlowStateManager, PENDING_STALE_MS } from '~/flow/manager';
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
@@ -26,9 +26,35 @@ jest.mock('@librechat/data-schemas', () => ({
     error: jest.fn(),
     debug: jest.fn(),
   },
+  getTenantId: jest.fn(),
+  SYSTEM_TENANT_ID: '__SYSTEM__',
   encryptV2: jest.fn(async (val: string) => `enc:${val}`),
   decryptV2: jest.fn(async (val: string) => val.replace(/^enc:/, '')),
 }));
+
+const credentialSetId = 'token-expiry-credential-set';
+const tokenMetadata = { credential_set_id: credentialSetId };
+
+function bindingMetadata(serverUrl: string) {
+  return {
+    authorization_endpoint: new URL('authorize', serverUrl).href,
+    token_endpoint: new URL('token', serverUrl).href,
+    server_url: new URL(serverUrl).href,
+    client_source: 'dynamic' as const,
+    resource: new URL(serverUrl).href,
+  };
+}
+
+async function seedStoredClient(tokenStore: InMemoryTokenStore, serverUrl: string) {
+  await tokenStore.createToken({
+    userId: 'u1',
+    type: 'mcp_oauth_client',
+    identifier: 'mcp:test-srv:client',
+    token: 'enc:{"client_id":"test-client"}',
+    expiresIn: 86400,
+    metadata: { ...tokenMetadata, ...bindingMetadata(serverUrl) },
+  });
+}
 
 describe('MCP OAuth Token Expiry Scenarios', () => {
   afterEach(() => {
@@ -73,6 +99,7 @@ describe('MCP OAuth Token Expiry Scenarios', () => {
         identifier: 'mcp:test-srv',
         token: `enc:${initial.access_token}`,
         expiresIn: -1,
+        metadata: tokenMetadata,
       });
       await tokenStore.createToken({
         userId: 'u1',
@@ -80,7 +107,9 @@ describe('MCP OAuth Token Expiry Scenarios', () => {
         identifier: 'mcp:test-srv:refresh',
         token: `enc:${initial.refresh_token}`,
         expiresIn: 86400,
+        metadata: tokenMetadata,
       });
+      await seedStoredClient(tokenStore, server.url);
 
       const refreshCallback = async (refreshToken: string): Promise<MCPOAuthTokens> => {
         const res = await fetch(`${server.url}token`, {
@@ -172,6 +201,7 @@ describe('MCP OAuth Token Expiry Scenarios', () => {
           identifier: 'mcp:test-srv',
           token: `enc:${initial.access_token}`,
           expiresIn: -1,
+          metadata: tokenMetadata,
         });
         await tokenStore.createToken({
           userId: 'u1',
@@ -179,7 +209,9 @@ describe('MCP OAuth Token Expiry Scenarios', () => {
           identifier: 'mcp:test-srv:refresh',
           token: `enc:${initial.refresh_token}`,
           expiresIn: 86400,
+          metadata: tokenMetadata,
         });
+        await seedStoredClient(tokenStore, server.url);
 
         // Simulate server revoking the refresh token
         server.issuedRefreshTokens.clear();
@@ -224,6 +256,7 @@ describe('MCP OAuth Token Expiry Scenarios', () => {
         identifier: 'mcp:test-srv',
         token: 'enc:expired-token',
         expiresIn: -1,
+        metadata: tokenMetadata,
       });
       await tokenStore.createToken({
         userId: 'u1',
@@ -231,7 +264,9 @@ describe('MCP OAuth Token Expiry Scenarios', () => {
         identifier: 'mcp:test-srv:refresh',
         token: 'enc:some-refresh-token',
         expiresIn: 86400,
+        metadata: tokenMetadata,
       });
+      await seedStoredClient(tokenStore, 'https://mcp.example.com/');
 
       const refreshCallback = jest
         .fn()
@@ -406,6 +441,8 @@ describe('MCP OAuth Token Expiry Scenarios', () => {
         serverName: 'test-srv',
         tokens: initial,
         createToken: tokenStore.createToken,
+        clientInfo: { client_id: 'test-client' },
+        metadata: bindingMetadata(server.url),
       });
 
       // Step 3: Verify tokens work
@@ -496,6 +533,8 @@ describe('MCP OAuth Token Expiry Scenarios', () => {
         createToken: tokenStore.createToken,
         updateToken: tokenStore.updateToken,
         findToken: tokenStore.findToken,
+        clientInfo: { client_id: 'test-client' },
+        metadata: bindingMetadata(server.url),
       });
 
       // Step 11: Verify new tokens work
@@ -540,6 +579,7 @@ describe('MCP OAuth Token Expiry Scenarios', () => {
         identifier: 'mcp:test-srv',
         token: 'enc:expired-token',
         expiresIn: -1,
+        metadata: tokenMetadata,
       });
       await tokenStore.createToken({
         userId: 'u1',
@@ -547,7 +587,9 @@ describe('MCP OAuth Token Expiry Scenarios', () => {
         identifier: 'mcp:test-srv:refresh',
         token: 'enc:valid-refresh',
         expiresIn: 86400,
+        metadata: tokenMetadata,
       });
+      await seedStoredClient(tokenStore, 'https://mcp.example.com/');
 
       let refreshCallCount = 0;
       const refreshCallback = jest.fn().mockImplementation(async () => {
@@ -611,10 +653,10 @@ describe('MCP OAuth Token Expiry Scenarios', () => {
         authorizationUrl: 'https://example.com/auth',
       });
 
-      // Manually age the flow to 3 minutes
+      // Manually age the flow past the staleness window
       const state = await flowManager.getFlowState(flowId, 'mcp_oauth');
       if (state) {
-        state.createdAt = Date.now() - 3 * 60 * 1000;
+        state.createdAt = Date.now() - PENDING_STALE_MS - 60 * 1000;
         await (flowStore as unknown as { set: (k: string, v: unknown) => Promise<void> }).set(
           `mcp_oauth:${flowId}`,
           state,
@@ -625,7 +667,7 @@ describe('MCP OAuth Token Expiry Scenarios', () => {
       expect(agedState?.status).toBe('PENDING');
 
       const age = agedState?.createdAt ? Date.now() - agedState.createdAt : 0;
-      expect(age).toBeGreaterThan(2 * 60 * 1000);
+      expect(age).toBeGreaterThan(PENDING_STALE_MS);
 
       // A new flow should be created (the stale one would be deleted + recreated)
       // This verifies our staleness check threshold

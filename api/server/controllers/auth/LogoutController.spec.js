@@ -1,15 +1,31 @@
 const cookies = require('cookie');
 
 const mockLogoutUser = jest.fn();
-const mockLogger = { warn: jest.fn(), error: jest.fn() };
+const mockLogger = { warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
 const mockIsEnabled = jest.fn();
 const mockGetOpenIdConfig = jest.fn();
+const mockClearCloudFrontCookies = jest.fn();
+const mockDeleteAllRefreshTokenBridges = jest.fn();
+const mockRevokeOpenIDRefreshTokenChain = jest.fn();
 
 jest.mock('cookie');
-jest.mock('@librechat/api', () => ({ isEnabled: (...args) => mockIsEnabled(...args) }));
-jest.mock('@librechat/data-schemas', () => ({ logger: mockLogger }));
+jest.mock('@librechat/api', () => ({
+  isEnabled: (...args) => mockIsEnabled(...args),
+  math: (_value, fallback) => fallback,
+  clearCloudFrontCookies: (...args) => mockClearCloudFrontCookies(...args),
+}));
+jest.mock('@librechat/data-schemas', () => ({
+  logger: mockLogger,
+  DEFAULT_REFRESH_TOKEN_EXPIRY: 7 * 24 * 60 * 60 * 1000,
+}));
 jest.mock('~/server/services/AuthService', () => ({
   logoutUser: (...args) => mockLogoutUser(...args),
+}));
+jest.mock('~/server/services/RefreshTokenBridge', () => ({
+  deleteAllRefreshTokenBridges: (...args) => mockDeleteAllRefreshTokenBridges(...args),
+}));
+jest.mock('~/server/services/OpenIDRefreshRecovery', () => ({
+  revokeOpenIDRefreshTokenChain: (...args) => mockRevokeOpenIDRefreshTokenChain(...args),
 }));
 jest.mock('~/strategies', () => ({ getOpenIdConfig: () => mockGetOpenIdConfig() }));
 
@@ -20,7 +36,11 @@ function buildReq(overrides = {}) {
     user: { _id: 'user1', openidId: 'oid1', provider: 'openid' },
     headers: { cookie: 'refreshToken=rt1' },
     session: {
-      openidTokens: { refreshToken: 'srt', idToken: 'small-id-token' },
+      openidTokens: {
+        refreshToken: 'srt',
+        idToken: 'small-id-token',
+        publicationFlightKey: 'recorded-publication-key',
+      },
       destroy: jest.fn(),
     },
     ...overrides,
@@ -50,6 +70,8 @@ beforeEach(() => {
   };
   cookies.parse.mockReturnValue({ refreshToken: 'cookie-rt' });
   mockLogoutUser.mockResolvedValue({ status: 200, message: 'Logout successful' });
+  mockDeleteAllRefreshTokenBridges.mockResolvedValue({ acknowledged: true, deletedCount: 1 });
+  mockRevokeOpenIDRefreshTokenChain.mockResolvedValue(['cookie-rt', 'srt']);
   mockIsEnabled.mockReturnValue(true);
   mockGetOpenIdConfig.mockReturnValue({
     serverMetadata: () => ({
@@ -242,6 +264,91 @@ describe('LogoutController', () => {
     });
   });
 
+  describe('bridge revocation', () => {
+    it('revokes all predecessor bridges and deletes the browser durable session', async () => {
+      const req = buildReq({
+        user: {
+          _id: 'user1',
+          openidId: 'oid1',
+          provider: 'openid',
+          tenantId: 'tenantA',
+        },
+      });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      expect(mockDeleteAllRefreshTokenBridges).toHaveBeenCalledWith({
+        userId: 'user1',
+        tenantId: 'tenantA',
+      });
+      expect(mockRevokeOpenIDRefreshTokenChain).toHaveBeenCalledWith({
+        req,
+        user: req.user,
+        identityContext: {
+          appUserId: 'user1',
+          openidSubject: 'oid1',
+          tenantId: 'tenantA',
+          openidIssuer: undefined,
+        },
+        refreshTokens: ['cookie-rt', 'srt'],
+        publicationKeys: ['recorded-publication-key'],
+        ttl: 7 * 24 * 60 * 60 * 1000,
+      });
+      expect(mockRevokeOpenIDRefreshTokenChain.mock.invocationCallOrder[0]).toBeLessThan(
+        mockDeleteAllRefreshTokenBridges.mock.invocationCallOrder[0],
+      );
+      expect(mockLogoutUser).toHaveBeenCalledWith(req, 'cookie-rt');
+      expect(mockLogoutUser).toHaveBeenCalledWith(req, 'srt');
+      expect(mockLogoutUser).toHaveBeenCalledTimes(2);
+      expect(req.session.openidTokens).toBeUndefined();
+    });
+
+    it('deletes successors retained by completed flights before a late refresh response arrives', async () => {
+      mockRevokeOpenIDRefreshTokenChain.mockResolvedValue([
+        'cookie-rt',
+        'srt',
+        'grant-successor',
+        'publication-successor',
+      ]);
+      const req = buildReq();
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      expect(mockLogoutUser).toHaveBeenCalledWith(req, 'cookie-rt');
+      expect(mockLogoutUser).toHaveBeenCalledWith(req, 'srt');
+      expect(mockLogoutUser).toHaveBeenCalledWith(req, 'grant-successor');
+      expect(mockLogoutUser).toHaveBeenCalledWith(req, 'publication-successor');
+      expect(mockLogoutUser).toHaveBeenCalledTimes(4);
+    });
+
+    it('fails closed before logout when bridge revocation fails', async () => {
+      mockDeleteAllRefreshTokenBridges.mockRejectedValue(new Error('bridge delete failed'));
+      const req = buildReq();
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      expect(mockLogoutUser).not.toHaveBeenCalled();
+      expect(req.session.openidTokens).toBeDefined();
+      expect(res.status).toHaveBeenCalledWith(500);
+    });
+
+    it('fails closed before deleting auth state when the refresh-flight fence fails', async () => {
+      mockRevokeOpenIDRefreshTokenChain.mockRejectedValue(new Error('flight fence failed'));
+      const req = buildReq();
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      expect(mockDeleteAllRefreshTokenBridges).not.toHaveBeenCalled();
+      expect(mockLogoutUser).not.toHaveBeenCalled();
+      expect(req.session.openidTokens).toBeDefined();
+      expect(res.status).toHaveBeenCalledWith(500);
+    });
+  });
+
   describe('cookie clearing', () => {
     it('clears all auth cookies on successful logout', async () => {
       const req = buildReq();
@@ -254,6 +361,326 @@ describe('LogoutController', () => {
       expect(res.clearCookie).toHaveBeenCalledWith('openid_id_token');
       expect(res.clearCookie).toHaveBeenCalledWith('openid_user_id');
       expect(res.clearCookie).toHaveBeenCalledWith('token_provider');
+    });
+
+    it('calls clearCloudFrontCookies on successful logout', async () => {
+      const req = buildReq({ user: { _id: 'user1', tenantId: 'tenantA' } });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      expect(mockClearCloudFrontCookies).toHaveBeenCalledWith(res, {
+        userId: 'user1',
+        tenantId: 'tenantA',
+      });
+    });
+  });
+
+  describe('URL length limit and logout_hint fallback', () => {
+    it('uses logout_hint when id_token makes URL exceed default limit (2000 chars)', async () => {
+      const longIdToken = 'a'.repeat(3000);
+      const req = buildReq({
+        user: { _id: 'user1', openidId: 'oid1', provider: 'openid', email: 'user@example.com' },
+        session: {
+          openidTokens: { refreshToken: 'srt', idToken: longIdToken },
+          destroy: jest.fn(),
+        },
+      });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).not.toContain('id_token_hint=');
+      expect(body.redirect).toContain('logout_hint=user%40example.com');
+      expect(body.redirect).toContain('client_id=my-client-id');
+      expect(mockLogger.debug).toHaveBeenCalledWith(expect.stringContaining('Logout URL too long'));
+    });
+
+    it('uses id_token_hint when URL is within default limit', async () => {
+      const shortIdToken = 'short-token';
+      const req = buildReq({
+        session: {
+          openidTokens: { refreshToken: 'srt', idToken: shortIdToken },
+          destroy: jest.fn(),
+        },
+      });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).toContain('id_token_hint=short-token');
+      expect(body.redirect).not.toContain('logout_hint=');
+      expect(body.redirect).not.toContain('client_id=');
+    });
+
+    it('respects custom OPENID_MAX_LOGOUT_URL_LENGTH', async () => {
+      process.env.OPENID_MAX_LOGOUT_URL_LENGTH = '500';
+      const mediumIdToken = 'a'.repeat(600);
+      const req = buildReq({
+        user: { _id: 'user1', openidId: 'oid1', provider: 'openid', email: 'user@example.com' },
+        session: {
+          openidTokens: { refreshToken: 'srt', idToken: mediumIdToken },
+          destroy: jest.fn(),
+        },
+      });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).not.toContain('id_token_hint=');
+      expect(body.redirect).toContain('logout_hint=user%40example.com');
+    });
+
+    it('uses username as logout_hint when email is not available', async () => {
+      const longIdToken = 'a'.repeat(3000);
+      const req = buildReq({
+        user: {
+          _id: 'user1',
+          openidId: 'oid1',
+          provider: 'openid',
+          username: 'testuser',
+        },
+        session: {
+          openidTokens: { refreshToken: 'srt', idToken: longIdToken },
+          destroy: jest.fn(),
+        },
+      });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).toContain('logout_hint=testuser');
+    });
+
+    it('uses openidId as logout_hint when email and username are not available', async () => {
+      const longIdToken = 'a'.repeat(3000);
+      const req = buildReq({
+        user: { _id: 'user1', openidId: 'unique-oid-123', provider: 'openid' },
+        session: {
+          openidTokens: { refreshToken: 'srt', idToken: longIdToken },
+          destroy: jest.fn(),
+        },
+      });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).toContain('logout_hint=unique-oid-123');
+    });
+
+    it('uses openidId as logout_hint when email and username are explicitly null', async () => {
+      const longIdToken = 'a'.repeat(3000);
+      const req = buildReq({
+        user: {
+          _id: 'user1',
+          openidId: 'oid-without-email',
+          provider: 'openid',
+          email: null,
+          username: null,
+        },
+        session: {
+          openidTokens: { refreshToken: 'srt', idToken: longIdToken },
+          destroy: jest.fn(),
+        },
+      });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).not.toContain('id_token_hint=');
+      expect(body.redirect).toContain('logout_hint=oid-without-email');
+      expect(body.redirect).toContain('client_id=my-client-id');
+    });
+
+    it('uses only client_id when absolutely no hint is available', async () => {
+      const longIdToken = 'a'.repeat(3000);
+      const req = buildReq({
+        user: {
+          _id: 'user1',
+          openidId: '',
+          provider: 'openid',
+          email: '',
+          username: '',
+        },
+        session: {
+          openidTokens: { refreshToken: 'srt', idToken: longIdToken },
+          destroy: jest.fn(),
+        },
+      });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).not.toContain('id_token_hint=');
+      expect(body.redirect).not.toContain('logout_hint=');
+      expect(body.redirect).toContain('client_id=my-client-id');
+    });
+
+    it('warns about missing OPENID_CLIENT_ID when URL is too long', async () => {
+      delete process.env.OPENID_CLIENT_ID;
+      const longIdToken = 'a'.repeat(3000);
+      const req = buildReq({
+        user: { _id: 'user1', openidId: 'oid1', provider: 'openid', email: 'user@example.com' },
+        session: {
+          openidTokens: { refreshToken: 'srt', idToken: longIdToken },
+          destroy: jest.fn(),
+        },
+      });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).not.toContain('id_token_hint=');
+      expect(body.redirect).toContain('logout_hint=');
+      expect(body.redirect).not.toContain('client_id=');
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('OPENID_CLIENT_ID is not set'),
+      );
+    });
+
+    it('falls back to logout_hint for cookie-sourced long token', async () => {
+      const longCookieToken = 'a'.repeat(3000);
+      cookies.parse.mockReturnValue({
+        refreshToken: 'cookie-rt',
+        openid_id_token: longCookieToken,
+      });
+      const req = buildReq({
+        user: { _id: 'user1', openidId: 'oid1', provider: 'openid', email: 'user@example.com' },
+        session: { destroy: jest.fn() },
+      });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).not.toContain('id_token_hint=');
+      expect(body.redirect).toContain('logout_hint=user%40example.com');
+      expect(body.redirect).toContain('client_id=my-client-id');
+    });
+
+    it('keeps id_token_hint when projected URL length equals the max', async () => {
+      const baseUrl = new URL('https://idp.example.com/logout');
+      baseUrl.searchParams.set('post_logout_redirect_uri', 'https://app.example.com/login');
+      const baseLength = baseUrl.toString().length;
+      const tokenLength = 2000 - baseLength - '&id_token_hint='.length;
+      const exactToken = 'a'.repeat(tokenLength);
+
+      const req = buildReq({
+        session: {
+          openidTokens: { refreshToken: 'srt', idToken: exactToken },
+          destroy: jest.fn(),
+        },
+      });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).toContain('id_token_hint=');
+      expect(body.redirect).not.toContain('logout_hint=');
+    });
+
+    it('falls back to logout_hint when projected URL is one char over the max', async () => {
+      const baseUrl = new URL('https://idp.example.com/logout');
+      baseUrl.searchParams.set('post_logout_redirect_uri', 'https://app.example.com/login');
+      const baseLength = baseUrl.toString().length;
+      const tokenLength = 2000 - baseLength - '&id_token_hint='.length + 1;
+      const overToken = 'a'.repeat(tokenLength);
+
+      const req = buildReq({
+        user: { _id: 'user1', openidId: 'oid1', provider: 'openid', email: 'user@example.com' },
+        session: {
+          openidTokens: { refreshToken: 'srt', idToken: overToken },
+          destroy: jest.fn(),
+        },
+      });
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).not.toContain('id_token_hint=');
+      expect(body.redirect).toContain('logout_hint=');
+    });
+  });
+
+  describe('invalid OPENID_MAX_LOGOUT_URL_LENGTH values', () => {
+    it('silently uses default when value is empty', async () => {
+      process.env.OPENID_MAX_LOGOUT_URL_LENGTH = '';
+      const req = buildReq();
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      expect(mockLogger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining('Invalid OPENID_MAX_LOGOUT_URL_LENGTH'),
+      );
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).toContain('id_token_hint=small-id-token');
+    });
+
+    it('warns and uses default for partial numeric string', async () => {
+      process.env.OPENID_MAX_LOGOUT_URL_LENGTH = '500abc';
+      const req = buildReq();
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Invalid OPENID_MAX_LOGOUT_URL_LENGTH'),
+      );
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).toContain('id_token_hint=small-id-token');
+    });
+
+    it('warns and uses default for zero value', async () => {
+      process.env.OPENID_MAX_LOGOUT_URL_LENGTH = '0';
+      const req = buildReq();
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Invalid OPENID_MAX_LOGOUT_URL_LENGTH'),
+      );
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).toContain('id_token_hint=small-id-token');
+    });
+
+    it('warns and uses default for negative value', async () => {
+      process.env.OPENID_MAX_LOGOUT_URL_LENGTH = '-1';
+      const req = buildReq();
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Invalid OPENID_MAX_LOGOUT_URL_LENGTH'),
+      );
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).toContain('id_token_hint=small-id-token');
+    });
+
+    it('warns and uses default for non-numeric string', async () => {
+      process.env.OPENID_MAX_LOGOUT_URL_LENGTH = 'abc';
+      const req = buildReq();
+      const res = buildRes();
+
+      await logoutController(req, res);
+
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Invalid OPENID_MAX_LOGOUT_URL_LENGTH'),
+      );
+      const body = res.send.mock.calls[0][0];
+      expect(body.redirect).toContain('id_token_hint=small-id-token');
     });
   });
 });

@@ -2,13 +2,11 @@
  * @jest-environment @happy-dom/jest-environment
  */
 import React from 'react';
-import { render, act } from '@testing-library/react';
 import { RecoilRoot } from 'recoil';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
-
+import { render, act } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { TAuthConfig } from '~/common';
-
 import { AuthContextProvider, useAuthContext } from '../AuthContext';
 import { SESSION_KEY } from '~/utils';
 
@@ -64,13 +62,21 @@ jest.mock('~/data-provider', () => ({
     error: null,
   })),
   useGetRole: jest.fn(() => ({ data: null })),
+  useListRoles: jest.fn(() => ({ data: undefined })),
 }));
 
 const authConfig: TAuthConfig = { loginRedirect: '/login', test: true };
 
 function TestConsumer() {
   const ctx = useAuthContext();
-  return <div data-testid="consumer" data-authenticated={ctx.isAuthenticated} />;
+  return (
+    <div
+      data-testid="consumer"
+      data-authenticated={ctx.isAuthenticated}
+      data-auth-ready={ctx.isAuthReady}
+      data-roles={JSON.stringify(ctx.roles ?? {})}
+    />
+  );
 }
 
 function renderProvider() {
@@ -109,6 +115,37 @@ function renderProviderLive() {
     </QueryClientProvider>,
   );
 }
+
+function renderOptionalProvider() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <RecoilRoot>
+        <MemoryRouter>
+          <AuthContextProvider authConfig={{ loginRedirect: '/login', optional: true }}>
+            <TestConsumer />
+          </AuthContextProvider>
+        </MemoryRouter>
+      </RecoilRoot>
+    </QueryClientProvider>,
+  );
+}
+
+describe('AuthContextProvider — test mode', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('is ready without starting silent refresh', () => {
+    const { getByTestId } = renderProvider();
+
+    expect(getByTestId('consumer')).toHaveAttribute('data-auth-ready', 'true');
+    expect(mockRefreshMutate).not.toHaveBeenCalled();
+  });
+});
 
 describe('AuthContextProvider — login onError redirect handling', () => {
   beforeEach(() => {
@@ -355,6 +392,53 @@ describe('AuthContextProvider — silentRefresh post-login redirect', () => {
   });
 });
 
+describe('AuthContextProvider — optional authentication', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    window.history.replaceState({}, '', '/share/share-1');
+  });
+
+  afterEach(() => {
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('keeps a public route visible when no refresh token exists', () => {
+    renderOptionalProvider();
+
+    const [, refreshOptions] = mockRefreshMutate.mock.calls[0] as [
+      unknown,
+      { onSuccess: (data: unknown) => void },
+    ];
+    act(() => {
+      refreshOptions.onSuccess(undefined);
+    });
+
+    expect(mockNavigate).not.toHaveBeenCalled();
+    expect(document.querySelector('[data-testid="consumer"]')).toHaveAttribute(
+      'data-auth-ready',
+      'true',
+    );
+  });
+
+  it('keeps a public route visible when session refresh fails', () => {
+    renderOptionalProvider();
+
+    const [, refreshOptions] = mockRefreshMutate.mock.calls[0] as [
+      unknown,
+      { onError: (error: unknown) => void },
+    ];
+    act(() => {
+      refreshOptions.onError(new Error('No session'));
+    });
+
+    expect(mockNavigate).not.toHaveBeenCalled();
+    expect(document.querySelector('[data-testid="consumer"]')).toHaveAttribute(
+      'data-auth-ready',
+      'true',
+    );
+  });
+});
+
 describe('AuthContextProvider — silentRefresh subdirectory deployment', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -442,6 +526,133 @@ describe('AuthContextProvider — logout error handling', () => {
 
     expect(replaceSpy).not.toHaveBeenCalled();
     expect(getByTestId('consumer').getAttribute('data-authenticated')).toBe('false');
+    jest.useRealTimers();
+  });
+});
+
+describe('AuthContextProvider — custom role detection and fetching', () => {
+  const mockUseGetRole = jest.requireMock('~/data-provider').useGetRole;
+  const staffPermissions = {
+    name: 'STAFF',
+    permissions: { PROMPTS: { USE: true, CREATE: false } },
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    sessionStorage.clear();
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('calls useGetRole with the custom role name and enabled: true for custom role users', () => {
+    jest.useFakeTimers();
+
+    renderProviderLive();
+
+    const [, refreshOptions] = mockRefreshMutate.mock.calls[0] as [
+      unknown,
+      { onSuccess: (data: unknown) => void },
+    ];
+
+    act(() => {
+      refreshOptions.onSuccess({ user: { id: '1', role: 'STAFF' }, token: 'tok' });
+    });
+    act(() => {
+      jest.advanceTimersByTime(100);
+    });
+
+    const staffCalls = mockUseGetRole.mock.calls.filter(([name]: [string]) => name === 'STAFF');
+    expect(staffCalls.length).toBeGreaterThan(0);
+    const lastStaffCall = staffCalls[staffCalls.length - 1];
+    expect(lastStaffCall[1]).toEqual(expect.objectContaining({ enabled: true }));
+
+    jest.useRealTimers();
+  });
+
+  it('calls useGetRole with enabled: false for USER role users', () => {
+    jest.useFakeTimers();
+
+    renderProviderLive();
+
+    const [, refreshOptions] = mockRefreshMutate.mock.calls[0] as [
+      unknown,
+      { onSuccess: (data: unknown) => void },
+    ];
+
+    act(() => {
+      refreshOptions.onSuccess({ user: { id: '1', role: 'USER' }, token: 'tok' });
+    });
+    act(() => {
+      jest.advanceTimersByTime(100);
+    });
+
+    const sentinelCalls = mockUseGetRole.mock.calls.filter(([name]: [string]) => name === '_');
+    expect(sentinelCalls.length).toBeGreaterThan(0);
+    for (const call of sentinelCalls) {
+      expect(call[1]).toEqual(expect.objectContaining({ enabled: false }));
+    }
+
+    jest.useRealTimers();
+  });
+
+  it('calls useGetRole with enabled: false for ADMIN role users', () => {
+    jest.useFakeTimers();
+
+    renderProviderLive();
+
+    const [, refreshOptions] = mockRefreshMutate.mock.calls[0] as [
+      unknown,
+      { onSuccess: (data: unknown) => void },
+    ];
+
+    act(() => {
+      refreshOptions.onSuccess({ user: { id: '1', role: 'ADMIN' }, token: 'tok' });
+    });
+    act(() => {
+      jest.advanceTimersByTime(100);
+    });
+
+    const sentinelCalls = mockUseGetRole.mock.calls.filter(([name]: [string]) => name === '_');
+    expect(sentinelCalls.length).toBeGreaterThan(0);
+    for (const call of sentinelCalls) {
+      expect(call[1]).toEqual(expect.objectContaining({ enabled: false }));
+    }
+
+    jest.useRealTimers();
+  });
+
+  it('includes custom role data in the roles context map when loaded', () => {
+    jest.useFakeTimers();
+    mockUseGetRole.mockImplementation((name: string, opts?: { enabled?: boolean }) => {
+      if (name === 'STAFF' && opts?.enabled) {
+        return { data: staffPermissions };
+      }
+      return { data: null };
+    });
+
+    const { getByTestId } = renderProviderLive();
+
+    const [, refreshOptions] = mockRefreshMutate.mock.calls[0] as [
+      unknown,
+      { onSuccess: (data: unknown) => void },
+    ];
+
+    act(() => {
+      refreshOptions.onSuccess({ user: { id: '1', role: 'STAFF' }, token: 'tok' });
+    });
+    act(() => {
+      jest.advanceTimersByTime(100);
+    });
+
+    const rolesAttr = getByTestId('consumer').getAttribute('data-roles') ?? '{}';
+    const roles = JSON.parse(rolesAttr);
+    expect(roles).toHaveProperty('STAFF');
+    expect(roles.STAFF).toEqual(staffPermissions);
+
+    mockUseGetRole.mockReturnValue({ data: null });
     jest.useRealTimers();
   });
 });

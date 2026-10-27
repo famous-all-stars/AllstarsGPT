@@ -5,7 +5,7 @@ import { getFileType, cn } from '~/utils';
 import FilePreview from './FilePreview';
 import RemoveFile from './RemoveFile';
 
-/** A second action offered in place of the subtitle, revealed when the chip is hovered or holds focus. */
+/** A second action offered in place of the subtitle, stated on the chip rather than revealed on hover. */
 export type SubtitleAction = {
   label: string;
   onClick: () => void;
@@ -21,6 +21,8 @@ const FileContainer = ({
   buttonClassName,
   containerClassName,
   onDelete,
+  removeLabel,
+  removeDisabled,
   onClick,
 }: {
   file: Partial<ExtendedFile | TFile>;
@@ -56,6 +58,9 @@ const FileContainer = ({
   buttonClassName?: string;
   containerClassName?: string;
   onDelete?: () => void;
+  /** Accessible name for the remove control; defaults to a generic "Remove file". */
+  removeLabel?: string;
+  removeDisabled?: boolean;
   onClick?: React.MouseEventHandler<HTMLButtonElement>;
 }) => {
   const fileType = getFileType(overrideType ?? file.type);
@@ -67,19 +72,19 @@ const FileContainer = ({
     buttonClassName,
   );
   const focusRing =
-    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-text-primary focus-visible:ring-offset-1 focus-visible:ring-offset-surface-primary';
+    'focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-text-primary focus-visible:ring-offset-1 focus-visible:ring-offset-surface-primary';
   /** The full-bleed target sits inside the surface's `overflow-hidden`, so an offset ring
    * would be clipped away entirely; the inset ring draws within the target's own box and the
    * matching radius keeps it inside the surface's rounded corners. */
   const insetFocusRing =
-    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-text-primary';
+    'focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-text-primary';
 
   const details = (
-    <div className="w-56 p-1.5">
+    <div className="w-56 max-w-full p-1.5">
       <div className="flex flex-row items-center gap-2">
         <FilePreview file={file} fileType={fileType} className="relative" />
         <div className="overflow-hidden">
-          <div className="truncate font-medium" title={visibleName}>
+          <div dir="auto" className="truncate font-medium" title={visibleName}>
             {visibleName}
           </div>
           {subtitleAction != null ? (
@@ -87,34 +92,26 @@ const FileContainer = ({
             <button
               type="button"
               onClick={subtitleAction.onClick}
-              aria-label={subtitleAction.label}
               className={cn(
-                /** Reads as the subtitle it replaces, so no colour of its own; the underline is
-                 * the only thing marking it as clickable, and it lands once the pointer is on
-                 * the label rather than merely on the chip. The hit area is the label and
-                 * nothing more: `inline-block` keeps it off the rest of the row, and
-                 * `leading-4` keeps it inside its 20px line so the chip's own center still
-                 * opens the editor. */
-                'pointer-events-auto relative z-10 inline-block max-w-full truncate rounded text-left align-middle leading-4 text-text-secondary hover:underline',
+                /** The chip's only cue that its text can be brought back, so it states itself
+                 * at rest instead of replacing the file type on hover: an affordance that only
+                 * appears under a pointer is one most people never find, and touch has no
+                 * pointer to find it with. Underlined for the same reason — as a permanent
+                 * subtitle it would otherwise read as a description rather than a control. The
+                 * hit area is the label and nothing more: `inline-block` keeps it off the rest
+                 * of the row, and `leading-4` keeps it inside its 20px line so the chip's own
+                 * center still opens the editor. The colour shift answers focus as well as
+                 * hover: the ring already announces focus, but leaving the two input modes
+                 * with different feedback is a difference with no reason behind it. */
+                'text-text-secondary hover:text-text-primary focus-visible:text-text-primary pointer-events-auto relative z-10 inline-block max-w-full truncate rounded text-start align-middle leading-4 underline underline-offset-2',
                 focusRing,
               )}
             >
-              <span
-                aria-hidden="true"
-                className="group-focus-within:hidden group-hover:hidden [@media(hover:none)]:hidden"
-              >
-                {fileType.title}
-              </span>
-              <span
-                aria-hidden="true"
-                className="hidden group-focus-within:inline group-hover:inline [@media(hover:none)]:inline"
-              >
-                {subtitleAction.label}
-              </span>
+              {subtitleAction.label}
             </button>
           ) : (
             (subtitle ?? (
-              <div className="truncate text-text-secondary" title={fileType.title}>
+              <div className="text-text-secondary truncate" title={fileType.title}>
                 {fileType.title}
               </div>
             ))
@@ -126,7 +123,7 @@ const FileContainer = ({
 
   return (
     <div
-      className={cn('group relative inline-block text-sm text-text-primary', containerClassName)}
+      className={cn('group text-text-primary relative inline-block text-sm', containerClassName)}
     >
       {subtitleAction != null ? (
         <div className={surfaceClassName}>
@@ -152,7 +149,7 @@ const FileContainer = ({
           {details}
         </button>
       )}
-      {onDelete && <RemoveFile onRemove={onDelete} />}
+      {onDelete && <RemoveFile onRemove={onDelete} label={removeLabel} disabled={removeDisabled} />}
     </div>
   );
 };

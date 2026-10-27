@@ -180,6 +180,7 @@ describe('configured content inspection', () => {
       source: 'message',
       field: 'text',
       provenance: 'user',
+      occurrences: 1,
     };
     expect(logger.info).toHaveBeenCalledWith(
       `[content-filter] Audit-only finding ${JSON.stringify(metadata)}`,
@@ -342,6 +343,29 @@ describe('configured content inspection', () => {
     expect(inspectContent([fragment('message', 'text', text)], { filters })).toMatchObject({
       ruleId,
     });
+  });
+
+  it('does not interpret the api-key detector label as an API key header', () => {
+    const filters: FiltersConfig = {
+      messages: {
+        pii: {
+          starterPatterns: ['api_key_header'],
+        },
+      },
+    };
+
+    expect(
+      inspectContent(
+        [
+          fragment(
+            'message',
+            'text',
+            'Submitted content contains an api-key header. Remove it and try again.',
+          ),
+        ],
+        { filters },
+      ),
+    ).toBeNull();
   });
 
   it('keeps the runtime starter catalog aligned with the public schema', () => {

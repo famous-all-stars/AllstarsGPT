@@ -3,11 +3,14 @@ import fs from 'fs';
 import path from 'path';
 import { constants } from 'zlib';
 import { defineConfig } from 'vite';
+import { Features } from 'lightningcss';
+import { THEME_BOOT_FILE } from 'librechat-data-provider';
 import { createRequire } from 'module';
 import { VitePWA } from 'vite-plugin-pwa';
 import { nodePolyfills } from 'vite-plugin-node-polyfills';
 import { compression, defineAlgorithm } from 'vite-plugin-compression2';
 import type { Plugin } from 'vite';
+import { bundledThemeBoot, injectThemeCacheVersion } from './src/Providers/bootVersion.ts';
 
 const require = createRequire(import.meta.url);
 
@@ -89,6 +92,8 @@ export default defineConfig(({ command }) => ({
         });
       },
     },
+    themeCacheVersion(),
+    copyPublicAssets(),
     VitePWA({
       injectRegister: 'auto', // 'auto' | 'manual' | 'disabled'
       registerType: 'autoUpdate', // 'prompt' | 'autoUpdate'
@@ -103,8 +108,9 @@ export default defineConfig(({ command }) => ({
           'assets/favicon*.png',
           'assets/icon-*.png',
           'assets/apple-touch-icon*.png',
+          /** `manifest.webmanifest` is not listed: vite-plugin-pwa always appends it as an
+           * additional manifest entry, so globbing it too duplicates the precache entry. */
           'assets/maskable-icon.png',
-          'manifest.webmanifest',
         ],
         globIgnores: [
           'images/**/*',
@@ -116,6 +122,14 @@ export default defineConfig(({ command }) => ({
           'assets/query-devtools*.js',
         ],
         maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
+        /**
+         * vite-plugin-pwa defaults this to `/^assets\//`, which is only true for the
+         * hashed bundle output: the icons live in `assets/` under stable filenames, so the
+         * default marks them immutable (`revision: null`) and an installed PWA would keep
+         * a rebranded icon forever. Match Vite's `[name].[hash].[ext]` shape instead so
+         * hashed chunks stay revision-free while the icons get content revisions.
+         */
+        dontCacheBustURLsMatching: /\.[\w-]{8}\.(?:js|css)$/,
         /** LibreChat mutates index.html per request for subpath and language support. */
         navigateFallback: null,
         /** Reloads window clients that cannot answer a ping after activation —
@@ -203,6 +217,12 @@ export default defineConfig(({ command }) => ({
     ],
   },
   publicDir: command === 'serve' ? './public' : false,
+  css: {
+    /** The CSS minifier lowers `:dir()` for `build.cssTarget` browsers into a `:lang()` list,
+     *  which mirrors by UI language instead of the element's direction and breaks LTR islands
+     *  in an RTL page. Tailwind keeps `:dir()` for the same reason; the minifier has to agree. */
+    lightningcss: { exclude: Features.DirSelector },
+  },
   build: {
     sourcemap: buildSourceMap,
     outDir: './dist',
@@ -212,6 +232,28 @@ export default defineConfig(({ command }) => ({
       output: {
         codeSplitting: {
           groups: [
+            /**
+             * The boot chunks import Vite's dynamic-import preload helper, the Buffer and
+             * process shims, DOMPurify, uuid and dayjs. The catch-all group below captures each
+             * module's dependencies with it, so these used to land in the mermaid chunk, which
+             * depends on them too, and every page then downloaded and evaluated that whole chunk
+             * before its first request. Claiming them first keeps mermaid lazy.
+             */
+            {
+              name: 'runtime-shims',
+              test: /vite[\\/]preload-helper|node_modules[\\/]vite-plugin-node-polyfills[\\/]/,
+              priority: 1,
+            },
+            {
+              name: 'shared-libs',
+              test: /node_modules[\\/](dompurify|uuid|dayjs)[\\/]/,
+              priority: 1,
+            },
+            {
+              name: 'utilities',
+              test: /node_modules[\\/]lodash(?:\.[^\\/]+)?[\\/]/,
+              priority: 1,
+            },
             {
               name(id: string) {
                 const normalizedId = id.replace(/\\/g, '/');
@@ -220,7 +262,13 @@ export default defineConfig(({ command }) => ({
                     return 'polyfills';
                   }
 
-                  if (normalizedId.includes('@hyperdx/')) {
+                  if (
+                    normalizedId.includes('@hyperdx/') ||
+                    normalizedId.includes('@opentelemetry/') ||
+                    /\/node_modules\/(?:rrweb(?:-snapshot)?|@rrweb\/[^/]+|fflate|protobufjs|long)\//.test(
+                      normalizedId,
+                    )
+                  ) {
                     return 'rum';
                   }
 
@@ -423,11 +471,30 @@ export default defineConfig(({ command }) => ({
   resolve: {
     alias: {
       '~': path.join(import.meta.dirname, 'src/'),
-      $fonts: path.resolve(import.meta.dirname, 'public/fonts'),
       'micromark-extension-math': 'micromark-extension-llm-math',
     },
   },
 }));
+
+/**
+ * Writes the deployment-theme cache version into the boot script's check, the same value
+ * `themeCache.ts` stamps on the entries it stores, so a role added to the registry retires
+ * every entry stored before it without anyone remembering to bump a number. It also emits
+ * the bundled themes resolved for the boot script, which the server embeds in a first visit.
+ */
+export function themeCacheVersion(): Plugin {
+  return {
+    name: 'theme-cache-version',
+    transformIndexHtml: injectThemeCacheVersion,
+    generateBundle() {
+      this.emitFile({
+        type: 'asset',
+        fileName: THEME_BOOT_FILE,
+        source: JSON.stringify(bundledThemeBoot()),
+      });
+    },
+  };
+}
 
 interface SourcemapExclude {
   excludeNodeModules?: boolean;
@@ -444,6 +511,56 @@ export function sourcemapExclude(opts?: SourcemapExclude): Plugin {
           map: { mappings: '' },
         };
       }
+    },
+  };
+}
+
+/**
+ * Production builds set `publicDir: false`, so nothing under public/ reaches dist on its
+ * own. This copies what the server actually has to serve: all of public/assets (the PWA
+ * icons plus the endpoint, tool and language logos referenced at runtime) and robots.txt.
+ * The font files live in the component library (`packages/client/src/theme/fonts`) and are
+ * emitted as bundle assets through the `@font-face` rules `tokens.css` imports, so only their
+ * licence texts are copied, next to them in assets/fonts: the SIL OFL lets a font be
+ * redistributed only with its licence.
+ *
+ * The copy MUST happen inside the build. vite-plugin-pwa globs dist/ for
+ * `workbox.globPatterns` from its `closeBundle` hook, which runs after every plugin's
+ * `writeBundle`, so copying here is what lets the `assets/*.png` icon patterns match. An
+ * `npm run build && node scripts/post-build.cjs` chain cannot: it runs after the service
+ * worker has already been generated, so the icons were silently absent from the precache
+ * manifest.
+ */
+export function copyPublicAssets(): Plugin {
+  const publicDir = path.resolve(import.meta.dirname, 'public');
+  const fontsDir = path.resolve(import.meta.dirname, '../packages/client/src/theme/fonts');
+  let outDir = path.resolve(import.meta.dirname, 'dist');
+  return {
+    name: 'copy-public-assets',
+    apply: 'build',
+    configResolved(config) {
+      outDir = path.resolve(config.root, config.build.outDir);
+    },
+    async writeBundle() {
+      await fs.promises.cp(path.join(publicDir, 'assets'), path.join(outDir, 'assets'), {
+        recursive: true,
+      });
+      await fs.promises.copyFile(
+        path.join(publicDir, 'robots.txt'),
+        path.join(outDir, 'robots.txt'),
+      );
+      const licences = (await fs.promises.readdir(fontsDir)).filter((name) =>
+        name.endsWith('.txt'),
+      );
+      await fs.promises.mkdir(path.join(outDir, 'assets', 'fonts'), { recursive: true });
+      await Promise.all(
+        licences.map((name) =>
+          fs.promises.copyFile(
+            path.join(fontsDir, name),
+            path.join(outDir, 'assets', 'fonts', name),
+          ),
+        ),
+      );
     },
   };
 }

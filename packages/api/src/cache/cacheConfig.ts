@@ -88,6 +88,12 @@ const cacheConfig: {
   GLOBAL_PREFIX_SEPARATOR: string;
   REDIS_MAX_LISTENERS: number;
   REDIS_PING_INTERVAL: number;
+  /** Milliseconds a heartbeat PING may go unanswered before the socket is presumed dead */
+  REDIS_PING_TIMEOUT: number;
+  /** Heartbeat interval in seconds for dedicated pub/sub subscriber connections (0 = disabled) */
+  REDIS_SUBSCRIBER_PING_INTERVAL: number;
+  /** TCP keepalive idle delay in ms for ioredis sockets (0 = kernel default idle time) */
+  REDIS_KEEP_ALIVE: number;
   /** Max delay between reconnection attempts in ms */
   REDIS_RETRY_MAX_DELAY: number;
   /** Max number of reconnection attempts (0 = infinite) */
@@ -129,14 +135,6 @@ const cacheConfig: {
    */
   REDIS_DELETE_CHUNK_SIZE: number;
   /**
-   * Number of keys to update in each batch during Redis SET operations.
-   * In cluster mode, keys are updated individually in parallel chunks to avoid CROSSSLOT errors.
-   * In single-node mode, keys are updated in batches using transactions (multi/exec).
-   * Lower values reduce memory usage but increase number of Redis calls.
-   * @default 1000
-   */
-  REDIS_UPDATE_CHUNK_SIZE: number;
-  /**
    * COUNT hint for Redis SCAN operations when scanning keys by pattern.
    * This is a hint to Redis about how many keys to scan in each iteration.
    * Higher values can reduce round trips but increase memory usage and latency per call.
@@ -167,6 +165,12 @@ const cacheConfig: {
   GLOBAL_PREFIX_SEPARATOR: '::',
   REDIS_MAX_LISTENERS: math(process.env.REDIS_MAX_LISTENERS, 40),
   REDIS_PING_INTERVAL: math(process.env.REDIS_PING_INTERVAL, 0),
+  /** Milliseconds a heartbeat PING may go unanswered before the socket is presumed dead */
+  REDIS_PING_TIMEOUT: math(process.env.REDIS_PING_TIMEOUT, 5000),
+  /** Heartbeat interval in seconds for dedicated pub/sub subscriber connections (0 = disabled) */
+  REDIS_SUBSCRIBER_PING_INTERVAL: math(process.env.REDIS_SUBSCRIBER_PING_INTERVAL, 15),
+  /** TCP keepalive idle delay in ms for ioredis sockets (0 = kernel default idle time) */
+  REDIS_KEEP_ALIVE: math(process.env.REDIS_KEEP_ALIVE, 10000),
   /** Max delay between reconnection attempts in ms */
   REDIS_RETRY_MAX_DELAY: math(process.env.REDIS_RETRY_MAX_DELAY, 3000),
   /** Max number of reconnection attempts (0 = infinite) */
@@ -203,15 +207,6 @@ const cacheConfig: {
    * @default 1000
    */
   REDIS_DELETE_CHUNK_SIZE: math(process.env.REDIS_DELETE_CHUNK_SIZE, 1000),
-
-  /**
-   * Number of keys to update in each batch during Redis SET operations.
-   * In cluster mode, keys are updated individually in parallel chunks to avoid CROSSSLOT errors.
-   * In single-node mode, keys are updated in batches using transactions (multi/exec).
-   * Lower values reduce memory usage but increase number of Redis calls.
-   * @default 1000
-   */
-  REDIS_UPDATE_CHUNK_SIZE: math(process.env.REDIS_UPDATE_CHUNK_SIZE, 1000),
 
   /**
    * COUNT hint for Redis SCAN operations when scanning keys by pattern.

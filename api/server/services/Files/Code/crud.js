@@ -1,9 +1,12 @@
 const FormData = require('form-data');
 const { logger } = require('@librechat/data-schemas');
 const { getCodeBaseURL } = require('@librechat/agents');
-const { EModelEndpoint, getCodeEnvRefs } = require('librechat-data-provider');
+const { clearFileCodeEnvRefs } = require('~/models');
 const {
   logAxiosError,
+  createCodeFileDeleter,
+  dispatchFileStorageOperation,
+  wrapCodeApiUploadError,
   appendCodeEnvFile,
   createAxiosInstance,
   codeServerHttpAgent,
@@ -71,107 +74,18 @@ async function getCodeOutputDownloadStream(fileIdentifier, identity, req, route 
   }
 }
 
-/**
- * Deletes a file from the Code Environment server.
- *
- * @param {ServerRequest} req - Current authenticated request, used to mint Code API auth.
- * @param {MongoFile} file - File metadata containing `metadata.codeEnvRef`.
- * @returns {Promise<void>}
- */
-async function deleteCodeEnvFile(req, file) {
-  const refs = getCodeEnvRefs(file?.metadata);
-  if (refs.length === 0) {
-    return;
-  }
-
-  const missingOrUnsupportedStatuses = new Set([404, 405]);
-  for (const [executionRouteKey, ref] of refs) {
-    const executionProfile = ref.executionProfile ?? 'default';
-    const environments =
-      req.config?.endpoints?.[EModelEndpoint.agents]?.statefulCodeSessions?.environments;
-    const configuredEnvironment = environments?.find(
-      (environment) =>
-        createCodeExecutionRouteKey(executionProfile, environment) === executionRouteKey,
-    );
-    if (
-      executionProfile === 'stateful' &&
-      executionRouteKey !== executionProfile &&
-      !configuredEnvironment
-    ) {
-      logger.warn(
-        `[deleteCodeEnvFile] Skipping remote cleanup for unmapped historical route ${executionRouteKey}`,
-      );
-      continue;
-    }
-    let baseURL;
-    try {
-      baseURL = getCodeExecutionBaseUrl(executionProfile, configuredEnvironment);
-    } catch (error) {
-      if (
-        executionProfile === 'stateful' &&
-        executionRouteKey === executionProfile &&
-        !configuredEnvironment
-      ) {
-        logger.warn(
-          '[deleteCodeEnvFile] Skipping remote cleanup for retired legacy stateful route',
-        );
-        continue;
-      }
-      throw error;
-    }
-    const query = buildCodeEnvDownloadQuery({
-      kind: ref.kind,
-      id: ref.id,
-      ...(ref.kind === 'skill' ? { version: ref.version } : {}),
-    });
-    const bridgeWorkerId =
-      configuredEnvironment?.workerId ?? configuredEnvironment?.pairing?.workerId;
-    const authHeaders = await getCodeApiAuthHeaders(req, bridgeWorkerId);
-    const baseRequest = {
-      method: 'delete',
-      headers: {
-        'User-Agent': 'LibreChat/1.0',
-        ...authHeaders,
-        ...codeExecutionHeaders({
-          executionProfile,
-          bridgeWorkerId,
-        }),
-      },
-      httpAgent: codeServerHttpAgent,
-      httpsAgent: codeServerHttpsAgent,
-      timeout: 15000,
-    };
-    const urls = [
-      `${baseURL}/sessions/${ref.storage_session_id}/objects/${ref.file_id}${query}`,
-      `${baseURL}/files/${ref.storage_session_id}/${ref.file_id}${query}`,
-    ];
-
-    let lastError;
-    let deleted = false;
-    for (const url of urls) {
-      try {
-        await axios({ ...baseRequest, url });
-        deleted = true;
-        break;
-      } catch (error) {
-        lastError = error;
-        if (!missingOrUnsupportedStatuses.has(error.response?.status)) {
-          throw error;
-        }
-      }
-    }
-    if (!deleted && lastError) {
-      logAxiosError({
-        error: lastError,
-        message: `Error deleting code environment file: ${lastError.message}`,
-      });
-      if (lastError.response?.status === 404) {
-        continue;
-      }
-      throw new Error(lastError.message || 'An error occurred during file deletion.');
-    }
-  }
-}
+const deleteCodeEnvFile = createCodeFileDeleter({
+  httpClient: axios,
+  getAuthHeaders: getCodeApiAuthHeaders,
+  getBaseUrl: getCodeExecutionBaseUrl,
+  routeKey: createCodeExecutionRouteKey,
+  profileHeaders: codeExecutionHeaders,
+  downloadQuery: buildCodeEnvDownloadQuery,
+  clearFileCodeEnvRefs,
+  logger,
+  httpAgent: codeServerHttpAgent,
+  httpsAgent: codeServerHttpsAgent,
+});
 
 /**
  * Uploads a file to the Code Environment server.
@@ -195,7 +109,8 @@ async function deleteCodeEnvFile(req, file) {
  * @param {string} [params.codeApiBaseUrl] - Trusted per-agent Code API endpoint.
  * @param {'default'|'stateful'} [params.executionProfile] - Trusted execution profile.
  * @param {string} [params.bridgeWorkerId] - Trusted worker selected for this execution.
- * @returns {Promise<{ storage_session_id: string; file_id: string }>}
+ * @param {AbortSignal} [params.signal] - Effective cancellation signal.
+ * @returns {Promise<{ storage_session_id: string; file_id: string; filename: string }>}
  *   The codeapi storage location of the uploaded file.
  * @throws {Error} If there's an error during the upload process.
  */
@@ -209,6 +124,8 @@ async function uploadCodeEnvFile({
   codeApiBaseUrl,
   executionProfile,
   bridgeWorkerId,
+  signal,
+  onUploadStart,
 }) {
   try {
     const form = new FormData();
@@ -232,9 +149,12 @@ async function uploadCodeEnvFile({
       timeout: 120000,
       maxContentLength: MAX_FILE_SIZE,
       maxBodyLength: MAX_FILE_SIZE,
+      ...(signal ? { signal } : {}),
     };
 
-    const response = await axios.post(`${baseURL}/upload`, form, options);
+    const response = await dispatchFileStorageOperation(onUploadStart, () =>
+      axios.post(`${baseURL}/upload`, form, options),
+    );
 
     /** @type {{ message: string; storage_session_id: string; files: Array<{ fileId: string; filename: string }> }} */
     const result = response.data;
@@ -245,14 +165,10 @@ async function uploadCodeEnvFile({
     return {
       storage_session_id: result.storage_session_id,
       file_id: result.files[0].fileId,
+      filename: result.files[0].filename,
     };
   } catch (error) {
-    throw new Error(
-      logAxiosError({
-        message: `Error uploading code environment file: ${error.message}`,
-        error,
-      }),
-    );
+    throw wrapCodeApiUploadError(error, `Error uploading code environment file: ${error.message}`);
   }
 }
 
@@ -291,6 +207,7 @@ async function batchUploadCodeEnvFiles({
   codeApiBaseUrl,
   executionProfile,
   bridgeWorkerId,
+  signal,
 }) {
   const form = new FormData();
   appendCodeEnvFileIdentity(form, { kind, id, version });
@@ -318,6 +235,7 @@ async function batchUploadCodeEnvFiles({
     timeout: 120000,
     maxContentLength: MAX_FILE_SIZE,
     maxBodyLength: MAX_FILE_SIZE,
+    signal,
   };
 
   const response = await axios.post(`${baseURL}/upload/batch`, form, options);

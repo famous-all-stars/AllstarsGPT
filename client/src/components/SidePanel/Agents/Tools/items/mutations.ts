@@ -1,8 +1,11 @@
-import { SkillsScope, AgentCapabilities, ArtifactModes } from 'librechat-data-provider';
+import { AgentCapabilities, ArtifactModes } from 'librechat-data-provider';
 import type { AgentItem } from './types';
 
 export type TogglePatch =
   | { type: 'builtin'; field: AgentCapabilities; value: boolean | string }
+  | { type: 'subagents'; enabled: boolean }
+  | { type: 'handoffs-remove' }
+  | { type: 'configure' }
   | { type: 'tool-add'; id: string }
   | { type: 'tool-remove'; id: string }
   | { type: 'skill-add'; id: string }
@@ -13,6 +16,12 @@ export type TogglePatch =
   | { type: 'action-remove'; actionId: string };
 
 function builtinTogglePatch(id: string, selected: boolean): TogglePatch {
+  if (id === 'subagents') {
+    return { type: 'subagents', enabled: !selected };
+  }
+  if (id === 'handoffs') {
+    return selected ? { type: 'handoffs-remove' } : { type: 'configure' };
+  }
   if (id === 'ask_user_question') {
     // Native tool presented as a builtin — it has no capability field; the
     // toggle edits agent.tools exactly like a plugin.
@@ -49,27 +58,4 @@ export function computeToggleAction(item: AgentItem, state: { selected: boolean 
   return state.selected
     ? { type: 'action-remove', actionId: item.id }
     : { type: 'action-add', actionId: item.id };
-}
-
-/**
- * Selection edits enable the capability and move its catalog between an
- * explicit allowlist and an authoring-only empty scope. They never produce
- * the full-catalog state; only the "use all skills" control can do that.
- */
-export function skillsSelectionTransition(
-  next: string[],
-  enabled: boolean | undefined,
-  authoringEnabled: boolean | undefined,
-  scope: SkillsScope | undefined,
-): { enabled?: boolean; authoringEnabled?: boolean; scope?: SkillsScope } {
-  const nextEnabled = next.length > 0;
-  const nextAuthoringEnabled = !nextEnabled;
-  const nextScope = next.length > 0 ? SkillsScope.selected : SkillsScope.none;
-  return {
-    ...(enabled === nextEnabled ? {} : { enabled: nextEnabled }),
-    ...(authoringEnabled === nextAuthoringEnabled
-      ? {}
-      : { authoringEnabled: nextAuthoringEnabled }),
-    ...(scope === nextScope ? {} : { scope: nextScope }),
-  };
 }

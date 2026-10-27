@@ -9,6 +9,8 @@ const {
   logAxiosError,
   detachOnAbort,
   getTokenExpiresAt,
+  getSafeErrorMetadata,
+  getOAuthCallbackUrl,
   refreshAccessToken,
   GenerationJobManager,
   createSSRFSafeAgents,
@@ -57,7 +59,7 @@ const validateAndUpdateTool = async ({ req, tool, assistant_id }) => {
   }
   if (!toolNameRegex.test(tool.function.name)) {
     const [functionName, domain] = tool.function.name.split(actionDelimiter);
-    actions = await getActions({ assistant_id, user: req.user.id }, true);
+    actions = await getActions({ assistantId: assistant_id, user: req.user.id }, true);
     const matchingActions = actions.filter((action) => {
       const metadata = action.metadata;
       if (!metadata) {
@@ -157,14 +159,11 @@ async function domainParser(domain, inverse = false) {
 /**
  * Loads action sets based on the user and assistant ID.
  *
- * @param {Object} searchParams - The parameters for loading action sets.
- * @param {string} searchParams.user - The user identifier.
- * @param {string} [searchParams.agent_id]- The agent identifier.
- * @param {string} [searchParams.assistant_id]- The assistant identifier.
+ * @param {import('@librechat/data-schemas').ActionQuery} query - The criteria for loading action sets.
  * @returns {Promise<Action[] | null>} A promise that resolves to an array of actions or `null` if no match.
  */
-async function loadActionSets(searchParams) {
-  return await getActions(searchParams, true);
+async function loadActionSets(query) {
+  return await getActions(query, true);
 }
 
 /**
@@ -183,6 +182,7 @@ async function loadActionSets(searchParams) {
  * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted events.
  * @param {boolean} [params.useSSRFProtection] - When true, uses SSRF-safe HTTP agents that validate resolved IPs at connect time.
  * @param {string[] | null} [params.allowedAddresses] - Optional admin exemption list of host:port pairs that bypass the SSRF private-IP block.
+ * @param {number} [params.timeoutMs] - Milliseconds before an action HTTP call is abandoned.
  * @returns { Promise<typeof tool | { _call: (toolInput: Object | string) => unknown}> } An object with `_call` method to execute the tool input.
  */
 async function createActionTool({
@@ -198,6 +198,7 @@ async function createActionTool({
   jobCreatedAt,
   useSSRFProtection = false,
   allowedAddresses,
+  timeoutMs,
 }) {
   const ssrfAgents = useSSRFProtection ? createSSRFSafeAgents(allowedAddresses) : undefined;
   /** @type {(toolInput: Object | string, config: GraphRunnableConfig) => Promise<unknown>} */
@@ -228,7 +229,10 @@ async function createActionTool({
 
               const stateToken = jwt.sign(statePayload, JWT_SECRET, { expiresIn: '10m' });
               try {
-                const redirectUri = `${process.env.DOMAIN_CLIENT}/api/actions/${action_id}/oauth/callback`;
+                const redirectUri = getOAuthCallbackUrl(
+                  process.env.DOMAIN_SERVER || 'http://localhost:3080',
+                  `/api/actions/${action_id}/oauth/callback`,
+                );
                 const params = new URLSearchParams({
                   client_id: metadata.oauth_client_id,
                   scope: metadata.auth.scope,
@@ -283,9 +287,10 @@ async function createActionTool({
                     state: stateToken,
                     userId: userId,
                     client_url: metadata.auth.client_url,
-                    redirect_uri: `${process.env.DOMAIN_SERVER}/api/actions/${action_id}/oauth/callback`,
+                    redirect_uri: redirectUri,
                     token_exchange_method: metadata.auth.token_exchange_method,
                     allowedAddresses,
+                    timeout: timeoutMs,
                     /** Encrypted values */
                     encrypted_oauth_client_id: encrypted.oauth_client_id,
                     encrypted_oauth_client_secret: encrypted.oauth_client_secret,
@@ -316,7 +321,7 @@ async function createActionTool({
                   throw error;
                 }
                 const errorMessage = 'Failed to authenticate OAuth tool';
-                logger.error(errorMessage, error);
+                logger.error(errorMessage, getSafeErrorMetadata(error));
                 throw new Error(errorMessage);
               }
             };
@@ -357,6 +362,7 @@ async function createActionTool({
                       token_exchange_method: metadata.auth.token_exchange_method,
                       encrypted_oauth_client_secret: encrypted.oauth_client_secret,
                       allowedAddresses,
+                      timeout: timeoutMs,
                     },
                     {
                       findToken,
@@ -390,7 +396,10 @@ async function createActionTool({
                 if (isAbortError(error)) {
                   throw error;
                 }
-                logger.error('Failed to refresh token, requesting new login:', error);
+                logger.error(
+                  'Failed to refresh token, requesting new login:',
+                  getSafeErrorMetadata(error),
+                );
                 await requestLogin();
               }
             } else {
@@ -411,7 +420,11 @@ async function createActionTool({
         }
       }
 
-      const response = await preparedExecutor.execute(ssrfAgents);
+      const response = await preparedExecutor.execute({
+        ...ssrfAgents,
+        timeout: timeoutMs,
+        signal: config?.signal,
+      });
 
       if (typeof response.data === 'object') {
         return JSON.stringify(response.data);
@@ -513,8 +526,8 @@ async function decryptMetadata(metadata) {
  */
 const deleteAssistantActions = async ({ req, assistant_id }) => {
   try {
-    await deleteActions({ assistant_id, user: req.user.id });
-    await deleteAssistant({ assistant_id, user: req.user.id });
+    await deleteActions({ assistantId: assistant_id, user: req.user.id });
+    await deleteAssistant({ assistantId: assistant_id, user: req.user.id });
   } catch (error) {
     const message = 'Trouble deleting Assistant Actions for Assistant ID: ' + assistant_id;
     logger.error(message, error);

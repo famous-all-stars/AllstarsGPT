@@ -5,7 +5,8 @@ import type { AddressInfo, Socket } from 'node:net';
  * Minimal RESP2 server standing in for a Redis node whose role can be flipped
  * between master and demoted replica. Real node-redis and ioredis clients speak
  * to it over TCP, which is what a READONLY failover scenario needs: the socket
- * stays open and healthy while every write is rejected.
+ * stays open and healthy while every write is rejected. PUBLISH fans out to the
+ * connections subscribed to the channel, so pub/sub between clients works too.
  */
 export type RespServer = {
   url: string;
@@ -14,6 +15,8 @@ export type RespServer = {
   connections: number;
   /** When true, write commands are rejected with the READONLY reply. */
   readonly: boolean;
+  /** When true, frames are recorded but never answered: a peer that has silently gone away. */
+  silent: boolean;
   commands: string[][];
   close(): Promise<void>;
 };
@@ -83,9 +86,45 @@ function parseFrames(buffer: Buffer): { frames: string[][]; rest: Buffer } {
 export async function startRespServer(port = 0): Promise<RespServer> {
   const store = new Map<string, string>();
   const sockets = new Set<Socket>();
-  const state = { connections: 0, readonly: false, commands: [] as string[][] };
+  const state = { connections: 0, readonly: false, silent: false, commands: [] as string[][] };
 
-  const reply = (args: string[]): string => {
+  const subscriptions = new Map<Socket, Set<string>>();
+
+  const channelsOf = (socket: Socket): Set<string> => {
+    let channels = subscriptions.get(socket);
+    if (!channels) {
+      channels = new Set();
+      subscriptions.set(socket, channels);
+    }
+    return channels;
+  };
+
+  const publish = (channel: string, message: string): number => {
+    let delivered = 0;
+    for (const [subscriber, channels] of subscriptions) {
+      if (channels.has(channel)) {
+        delivered += 1;
+        subscriber.write(`*3\r\n$7\r\nmessage\r\n${encodeBulk(channel)}${encodeBulk(message)}`);
+      }
+    }
+    return delivered;
+  };
+
+  const subscriptionReply = (socket: Socket, kind: string, names: string[]): string => {
+    const channels = channelsOf(socket);
+    return names
+      .map((name) => {
+        if (kind === 'subscribe') {
+          channels.add(name);
+        } else {
+          channels.delete(name);
+        }
+        return `*3\r\n${encodeBulk(kind)}${encodeBulk(name)}:${channels.size}\r\n`;
+      })
+      .join('');
+  };
+
+  const reply = (socket: Socket, args: string[]): string => {
     const command = args[0]?.toUpperCase() ?? '';
     if (state.readonly && WRITE_COMMANDS.has(command)) {
       return READONLY_REPLY;
@@ -93,6 +132,12 @@ export async function startRespServer(port = 0): Promise<RespServer> {
     switch (command) {
       case 'PING':
         return '+PONG\r\n';
+      case 'SUBSCRIBE':
+        return subscriptionReply(socket, 'subscribe', args.slice(1));
+      case 'UNSUBSCRIBE':
+        return subscriptionReply(socket, 'unsubscribe', args.slice(1));
+      case 'PUBLISH':
+        return `:${publish(args[1], args[2])}\r\n`;
       case 'INFO':
         return encodeBulk('# Server\r\nredis_version:7.2.4\r\nloading:0\r\n');
       case 'GET':
@@ -122,10 +167,15 @@ export async function startRespServer(port = 0): Promise<RespServer> {
       pending = rest;
       for (const frame of frames) {
         state.commands.push(frame);
-        socket.write(reply(frame));
+        if (!state.silent) {
+          socket.write(reply(socket, frame));
+        }
       }
     });
-    socket.on('close', () => sockets.delete(socket));
+    socket.on('close', () => {
+      sockets.delete(socket);
+      subscriptions.delete(socket);
+    });
     socket.on('error', () => undefined);
   });
 
@@ -143,6 +193,12 @@ export async function startRespServer(port = 0): Promise<RespServer> {
     },
     set readonly(value: boolean) {
       state.readonly = value;
+    },
+    get silent() {
+      return state.silent;
+    },
+    set silent(value: boolean) {
+      state.silent = value;
     },
     commands: state.commands,
     close: () =>

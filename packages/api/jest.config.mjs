@@ -1,8 +1,12 @@
+import { maxWorkers, workerIdleMemoryLimit } from '../../config/jest.workers.cjs';
+
 const esModules = [
+  '@librechat/code',
   '@langchain/langgraph',
   '@langchain/langgraph-checkpoint',
   '@langchain/langgraph-sdk',
   '@mistralai/mistralai',
+  '@modelcontextprotocol/ext-apps',
   'domelementtype',
   'domhandler',
   'dom-serializer',
@@ -41,6 +45,7 @@ export default {
   transformIgnorePatterns: [`/node_modules/(?!(${esModules})/).*/`],
   moduleNameMapper: {
     '^@src/(.*)$': '<rootDir>/src/$1',
+    '^~/api/(.*)$': '<rootDir>/../../api/$1',
     '~/(.*)': '<rootDir>/src/$1',
   },
   // coverageThreshold: {
@@ -52,7 +57,8 @@ export default {
   //   },
   // },
   setupFiles: ['<rootDir>/jest.setup.cjs', '<rootDir>/../../config/jest.setup.logging.cjs'],
-  maxWorkers: '50%',
+  maxWorkers,
+  workerIdleMemoryLimit,
   restoreMocks: true,
   testTimeout: 15000,
 };
